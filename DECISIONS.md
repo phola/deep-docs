@@ -114,6 +114,12 @@ Record of key design decisions for the deep-docs skill.
 
 **Rationale:** First real test on Buzz (87 components) revealed that a sub-agent given "write all components" will optimise for completion by producing "representative samples" (wrote 2 of 87). The fix is structural — the orchestrator loop makes skipping impossible because each spawn is for exactly one component. Verification step confirms output files exist before moving on. This is more reliable than reward/punishment language in prompts.
 
+## 2026-03-07: Scripted orchestration over LLM orchestration
+
+**Decision:** Per-component loops are driven by a bash script (scripts/orchestrate.sh), not by an LLM orchestrator agent. The script is mechanical — it parses the component inventory, loops, spawns one sub-agent per component via `openclaw agent`, verifies outputs, and moves on.
+
+**Rationale:** Two test runs on Buzz (87 components) proved that LLM agents cannot reliably orchestrate exhaustive per-component work. Both runs produced docs for only 2-3 "representative" components despite explicit instructions to cover all 87. This is a fundamental LLM completion bias — models optimise for "done" over "complete." No amount of prompt engineering (carrot, stick, explicit counting) reliably fixes it. The solution is structural: mechanical code handles the mechanical loop, LLMs handle the creative work (comprehension, writing, review).
+
 ## 2026-03-07: History mode epoch detection
 
 **Decision:** Group git history into meaningful epochs (not 1:1 with commits) using signals like new directories, large refactors, activity gaps, and tag boundaries.

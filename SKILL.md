@@ -186,15 +186,39 @@ When a sub-agent fails (timeout, error, partial output):
 
 For parallel sub-agents (large profile), allow individual failures without aborting siblings.
 
-## Sub-agent Spawning
+## Orchestration
 
-Use `sessions_spawn` with `runtime: "subagent"` for each sub-agent. Include in every task:
+**Use the orchestration script for per-component phases.** LLM agents have a completion
+bias — when told "do 87 things," they'll do a sample and declare success. The fix is
+structural: a bash script drives the loop mechanically, spawning one sub-agent per component.
+
+```bash
+# Full run (discover through review):
+scripts/orchestrate.sh all {{REPO_PATH}} {{DOCS_DIR}} [model]
+
+# Individual phases (for resume/retry):
+scripts/orchestrate.sh discover {{REPO_PATH}} {{DOCS_DIR}}
+scripts/orchestrate.sh comprehend {{REPO_PATH}} {{DOCS_DIR}}
+scripts/orchestrate.sh write {{REPO_PATH}} {{DOCS_DIR}}
+scripts/orchestrate.sh review {{REPO_PATH}} {{DOCS_DIR}}
+```
+
+The script:
+- Parses component-inventory.md and loops through every row
+- Spawns one `openclaw agent` per component
+- Verifies output files exist before moving on
+- Retries once on failure, then logs to skipped-components.md
+- Supports resume (skips components with existing outputs)
+- Appends to progress.md at every step
+
+Interview is still interactive (the primary agent handles it). The script takes over
+from discover onwards.
+
+## Sub-agent Prompts
+
+Each sub-agent spawned by the script receives:
 1. The hard rules (verbatim from above)
-2. The repo path
+2. The repo path and component path
 3. The docs output directory
-4. The relevant scratchpad files to read (not all — only what's needed)
-5. The specific phase instructions from the relevant reference file
-6. "On completion, append a progress line to {{DOCS_DIR}}/builder/progress.md"
-
-The orchestrator writes phase-level start/complete lines to progress.md directly.
-Sub-agents write their own completion lines (with key metrics from their work).
+4. Relevant scratchpad files
+5. The specific phase instructions
