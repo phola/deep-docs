@@ -98,6 +98,12 @@ Record of key design decisions for the deep-docs skill.
 
 **Rationale:** Diagrams require cross-component understanding (from synthesis). Generating them once ensures consistency across all docs. Write-phase agents embed from the canonical .mmd files rather than each inventing their own.
 
+## 2026-03-07: Unified progress log
+
+**Decision:** All phases append to a single `progress.md` file with timestamped one-line entries. Append-only, never rewritten.
+
+**Rationale:** Long runs (hours for large repos) need observability without digging through scratchpad files. One file to tail for the full picture.
+
 ## 2026-03-07: History mode epoch detection
 
 **Decision:** Group git history into meaningful epochs (not 1:1 with commits) using signals like new directories, large refactors, activity gaps, and tag boundaries.
