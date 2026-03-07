@@ -12,11 +12,25 @@ code extensively (though it may verify specific details).
 
 ## Per-Component Sub-agent Task
 
-Spawn one per component (dependency order).
+CRITICAL: The orchestrator MUST loop through EVERY component in component-inventory.md
+and spawn a write sub-agent for each one individually. Do NOT delegate "write all
+components" to a single agent — it WILL skip components to optimise for completion.
 
-For small repos (single sub-agent): combine all components into one task. Pass the full
-component list and instruct: "Write L2, L3, and L4 for each of these components in order:
-{{COMPONENT_LIST}}. Use the per-component structure below for each."
+Orchestrator write loop:
+```
+For each component in component-inventory.md (dependency order):
+  1. Spawn write sub-agent for this component
+  2. Verify L2/{{COMPONENT_SLUG}}.md, L3/{{COMPONENT_SLUG}}.md, L4/{{COMPONENT_SLUG}}.md exist
+  3. Log completion to progress.md
+  4. If failed after retry, log to skipped-components.md
+  5. Next component
+
+After ALL components: verify file count matches component count.
+Then spawn overview + L1 sub-agents.
+```
+
+For small repos only (≤5 components): a single sub-agent may handle all components,
+but the orchestrator must verify all output files exist before proceeding.
 
 ```
 Write documentation for the {{COMPONENT_NAME}} component.

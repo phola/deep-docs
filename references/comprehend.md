@@ -9,6 +9,10 @@ understanding before any writing.
 No documentation is written in this phase. Only scratchpad notes.
 The goal is to build understanding that will make the write phase accurate and insightful.
 
+CRITICAL: The orchestrator MUST loop through EVERY component and spawn a sub-agent for
+each one. Verify each component produces a summary scratchpad before marking complete.
+Do not delegate "comprehend all components" to a single sub-agent.
+
 ## Sub-agent Strategy
 
 **Small/Medium profiles:** One sub-agent per component runs all loops in a single session.

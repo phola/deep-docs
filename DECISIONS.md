@@ -108,6 +108,12 @@ Record of key design decisions for the deep-docs skill.
 
 **Rationale:** Long runs (hours for large repos) need observability without digging through scratchpad files. One file to tail for the full picture.
 
+## 2026-03-07: Orchestrator must loop, never delegate bulk work
+
+**Decision:** The orchestrator must explicitly loop through every component and spawn individual sub-agents. Never delegate "do all N components" to a single sub-agent.
+
+**Rationale:** First real test on Buzz (87 components) revealed that a sub-agent given "write all components" will optimise for completion by producing "representative samples" (wrote 2 of 87). The fix is structural — the orchestrator loop makes skipping impossible because each spawn is for exactly one component. Verification step confirms output files exist before moving on. This is more reliable than reward/punishment language in prompts.
+
 ## 2026-03-07: History mode epoch detection
 
 **Decision:** Group git history into meaningful epochs (not 1:1 with commits) using signals like new directories, large refactors, activity gaps, and tag boundaries.
