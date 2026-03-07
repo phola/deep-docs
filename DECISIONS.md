@@ -98,6 +98,10 @@ Record of key design decisions for the deep-docs skill.
 
 **Rationale:** Diagrams require cross-component understanding (from synthesis). Generating them once ensures consistency across all docs. Write-phase agents embed from the canonical .mmd files rather than each inventing their own.
 
+## 2026-03-07: Future — Visualisation web app
+
+**Idea (not yet built):** Real-time web app that reads progress.md and renders the documentation process as an animated graph/synapse visualisation. Components as nodes, comprehension loops as pulses, synthesis connections as edges forming, doc tiers filling in with colour. Separate repo/project.
+
 ## 2026-03-07: Unified progress log
 
 **Decision:** All phases append to a single `progress.md` file with timestamped one-line entries. Append-only, never rewritten.
