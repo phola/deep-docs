@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
+# Note: not using set -e so we can handle errors per-component
 
 # deep-docs orchestrator — drives the per-component loop mechanically
 # Usage: ./orchestrate.sh <phase> <repo_path> <docs_dir> [model]
@@ -35,15 +36,24 @@ log() {
 
 # Parse component-inventory.md table rows
 # Expected format: | # | Component | Slug | Path | Source Files | Language | Purpose | Key Files | Dependencies |
+trim() {
+  # Trim whitespace and backticks using bash builtins only
+  local val="$1"
+  val="${val#"${val%%[![:space:]]*}"}"  # trim leading
+  val="${val%"${val##*[![:space:]]}"}"  # trim trailing
+  val="${val//\`/}"                      # remove backticks
+  echo "$val"
+}
+
 parse_components() {
-  grep -E '^\| [0-9]' "$INVENTORY" | while IFS='|' read -r _ num name slug path files lang purpose key_files deps _rest; do
-    # Trim whitespace
-    name=$(echo "$name" | xargs)
-    slug=$(echo "$slug" | xargs)
-    path=$(echo "$path" | xargs)
-    files=$(echo "$files" | xargs)
-    echo "${slug}|${name}|${path}|${files}"
-  done
+  # Pre-extract with awk to avoid subshell PATH issues
+  /usr/bin/awk -F'|' '/^\| [0-9]/ {
+    gsub(/`/, "", $4); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4);  # slug
+    gsub(/`/, "", $3); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);  # name
+    gsub(/`/, "", $5); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5);  # path
+    gsub(/`/, "", $6); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6);  # files
+    if ($4 != "") print $4 "|" $3 "|" $5 "|" $6
+  }' "$INVENTORY"
 }
 
 count_components() {
@@ -56,10 +66,14 @@ spawn_agent() {
   local label="$2"
   local agent_timeout="${3:-$TIMEOUT}"
 
+  # Use a unique session per sub-agent spawn
+  local session_id="deep-docs-${label}-$(date +%s)"
+
   openclaw agent \
+    --session-id "$session_id" \
     --message "$task" \
     --timeout "$agent_timeout" \
-    --json 2>/dev/null | jq -r '.content // .error // "no output"'
+    --json 2>&1 | jq -r '.content // .error // "no output"' 2>/dev/null || echo "agent error"
 }
 
 # ============================================================
