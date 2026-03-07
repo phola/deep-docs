@@ -10,7 +10,8 @@ Read {{DOCS_DIR}}/builder/interview-notes.md for user context.
 Explore the repository at {{REPO_PATH}} thoroughly:
 
 1. INVENTORY
-   - Walk the entire file tree (excluding .git, node_modules, .venv, __pycache__, dist, build)
+   - Walk the entire file tree (excluding .git, node_modules, .venv, __pycache__, dist, build,
+     plus any exclusions specified in {{DOCS_DIR}}/builder/interview-notes.md)
    - Catalogue: languages used, frameworks detected, package managers, config files
    - Count files and lines per directory to assess size
 
@@ -41,7 +42,13 @@ OUTPUT two files:
 
 {{DOCS_DIR}}/builder/specs/component-inventory.md
 - Components in dependency order (foundations first)
-- For each: name, path, language, purpose, key files, dependencies on other components
+- Use this table format:
+
+| # | Component | Slug | Path | Language | Purpose | Key Files | Dependencies |
+|---|-----------|------|------|----------|---------|-----------|--------------|
+| 1 | Shared Utils | shared-utils | src/shared | Python | Common helpers | utils.py, config.py | (none) |
+| 2 | Auth | auth | src/auth | Python | Authentication | auth.py, models.py | shared-utils |
+
 - Mark any components that are unclear or need deeper investigation
 
 Do NOT write any documentation. Discovery only.

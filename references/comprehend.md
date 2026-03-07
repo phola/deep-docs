@@ -40,20 +40,20 @@ Delete the other two profile blocks before passing this prompt to the sub-agent.
 
 === SMALL PROFILE (3 loops) ===
 
-LOOP 1 — INVENTORY + DATA SHAPES
+LOOP 1 — INVENTORY + DATA SHAPES → scratchpad: comprehend-{{COMPONENT_SLUG}}-01-inventory.md
 - List every file: path, language, line count, rough purpose
 - Entry points, config files, test files
 - Schemas, types, interfaces, dataclasses, models, config structures
 - Input/output data formats, database tables, columns, relationships
 
-LOOP 2 — LOGIC + FLOW
+LOOP 2 — LOGIC + FLOW → scratchpad: comprehend-{{COMPONENT_SLUG}}-02-logic.md
 - Key function/method signatures with parameters and return types
 - What each does (read the implementation, don't guess from name)
 - Call graph: what calls what, in what order
 - External packages, inter-component imports, external services
 - Execution lifecycle: startup → processing → cleanup
 
-LOOP 3 — ERROR HANDLING + SIDE EFFECTS
+LOOP 3 — ERROR HANDLING + SIDE EFFECTS → scratchpad: comprehend-{{COMPONENT_SLUG}}-03-errors.md
 - What does this component read/write/mutate? (files, DB, env vars, APIs, stdout)
 - Concurrency concerns, shared state, locking
 - What can fail? How? Recovery mechanisms, retries, fallbacks
@@ -61,64 +61,64 @@ LOOP 3 — ERROR HANDLING + SIDE EFFECTS
 
 === MEDIUM PROFILE (5 loops) ===
 
-LOOP 1 — INVENTORY
+LOOP 1 — INVENTORY → scratchpad: comprehend-{{COMPONENT_SLUG}}-01-inventory.md
 - List every file: path, language, line count, rough purpose
 - Entry points, config files, test files
 
-LOOP 2 — DATA SHAPES
+LOOP 2 — DATA SHAPES → scratchpad: comprehend-{{COMPONENT_SLUG}}-02-data.md
 - Schemas, types, interfaces, dataclasses, models, config structures
 - Input/output data formats (JSON, CSV, Delta, API payloads...)
 - Database tables, columns, relationships
 
-LOOP 3 — FUNCTIONS + INTERNAL FLOW
+LOOP 3 — FUNCTIONS + INTERNAL FLOW → scratchpad: comprehend-{{COMPONENT_SLUG}}-03-logic.md
 - Key function/method signatures with parameters and return types
 - What each does (read the implementation, don't guess from name)
 - Call graph: what calls what, in what order
 - Execution lifecycle: startup → processing → cleanup
 
-LOOP 4 — DEPENDENCIES + STATE
+LOOP 4 — DEPENDENCIES + STATE → scratchpad: comprehend-{{COMPONENT_SLUG}}-04-deps.md
 - External packages: what, why, version constraints
 - Inter-component imports, external services (APIs, databases, file systems)
 - What does this component read/write/mutate? (files, DB, env vars, APIs)
 - Concurrency concerns, shared state, locking
 
-LOOP 5 — ERROR HANDLING + EDGE CASES
+LOOP 5 — ERROR HANDLING + EDGE CASES → scratchpad: comprehend-{{COMPONENT_SLUG}}-05-errors.md
 - What can fail? How? (exceptions, return codes, silent failures)
 - Recovery mechanisms: retries, fallbacks, circuit breakers
 - Edge cases: empty inputs, missing config, network failures, race conditions
 
 === LARGE PROFILE (7 loops) ===
 
-LOOP 1 — INVENTORY
+LOOP 1 — INVENTORY → scratchpad: comprehend-{{COMPONENT_SLUG}}-01-inventory.md
 - List every file: path, language, line count, rough purpose
 - Note entry points, config files, test files
 
-LOOP 2 — DATA SHAPES
+LOOP 2 — DATA SHAPES → scratchpad: comprehend-{{COMPONENT_SLUG}}-02-data.md
 - Schemas, types, interfaces, dataclasses, models, config structures
 - Input/output data formats (JSON, CSV, Delta, API payloads...)
 - Database tables, columns, relationships
 
-LOOP 3 — FUNCTIONS
+LOOP 3 — FUNCTIONS → scratchpad: comprehend-{{COMPONENT_SLUG}}-03-functions.md
 - Key function/method signatures with parameters and return types
 - What each does (read the implementation, don't guess from name)
 - Note side effects explicitly
 
-LOOP 4 — INTERNAL FLOW
+LOOP 4 — INTERNAL FLOW → scratchpad: comprehend-{{COMPONENT_SLUG}}-04-flow.md
 - Call graph: what calls what, in what order
 - Control flow: conditionals, loops, error paths
 - Execution lifecycle: startup → processing → cleanup
 
-LOOP 5 — DEPENDENCIES
+LOOP 5 — DEPENDENCIES → scratchpad: comprehend-{{COMPONENT_SLUG}}-05-deps.md
 - External packages: what, why, version constraints
 - Inter-component imports: what does this component use from others?
 - External services: APIs, databases, file systems, cloud services
 
-LOOP 6 — STATE & SIDE EFFECTS
+LOOP 6 — STATE & SIDE EFFECTS → scratchpad: comprehend-{{COMPONENT_SLUG}}-06-state.md
 - What does this component read? (files, DB, env vars, API responses)
 - What does it write/mutate? (files, DB, API calls, stdout)
 - Concurrency concerns, shared state, locking
 
-LOOP 7 — ERROR HANDLING
+LOOP 7 — ERROR HANDLING → scratchpad: comprehend-{{COMPONENT_SLUG}}-07-errors.md
 - What can fail? How does it fail? (exceptions, return codes, silent failures)
 - Recovery mechanisms: retries, fallbacks, circuit breakers
 - Edge cases: empty inputs, missing config, network failures, race conditions

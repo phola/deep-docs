@@ -29,7 +29,19 @@ Synthesise: 3 passes. Write: per component, parallel where no dependency conflic
 Level 0 = components with no dependencies on other project components.
 Level 1 = components depending only on Level 0 components. Etc.
 All components at the same level can run in parallel. Process levels sequentially.
-Record the grouping in calibration.md.
+Record the grouping in calibration.md as:
+
+```
+## Parallel Groups
+Level 0 (no dependencies): shared-utils, config
+Level 1: auth, database
+Level 2: api, worker
+```
+
+### Empty or Trivial Repo
+
+If <3 source files or 0 detectable components: inform the user that the repo appears
+too small for deep-docs. Offer to write a single comprehensive README instead.
 
 ### Conflicting Signals
 

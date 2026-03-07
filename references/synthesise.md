@@ -19,9 +19,20 @@ Read:
 - {{DOCS_DIR}}/builder/interview-notes.md
 - {{DOCS_DIR}}/builder/specs/scope-and-goals.md
 - {{DOCS_DIR}}/builder/specs/component-inventory.md
-- All SUMMARY scratchpads: {{DOCS_DIR}}/builder/.scratch/comprehend-*-summary.md
-  (Do NOT load individual loop scratchpads. If a summary is unclear on a specific
-   point, read ONLY the single relevant loop file for that component — never bulk-load.)
+
+CONTEXT MANAGEMENT:
+For repos with ≤20 components: read all summary scratchpads directly:
+  {{DOCS_DIR}}/builder/.scratch/comprehend-*-summary.md
+
+For repos with >20 components: synthesise in batches:
+  1. Group components by dependency level (from calibration.md parallel grouping)
+  2. Spawn one synthesis sub-agent per group, reading only that group's summaries
+  3. Each writes: .scratch/synthesise-group-{{N}}.md
+  4. Spawn a final synthesis sub-agent that reads ONLY the group-level outputs
+     (not raw summaries) to produce the cross-cutting synthesis files below
+
+In both cases: do NOT load individual loop scratchpads. If a summary is unclear on
+a specific point, read ONLY the single relevant loop file — never bulk-load.
 
 Run the synthesis passes listed below.
 

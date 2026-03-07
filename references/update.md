@@ -119,7 +119,7 @@ Write `{{DOCS_DIR}}/builder/last-run.md` in this exact format:
 
 ```markdown
 date: 2026-03-07T07:30:00Z
-mode: init
+mode: update
 profile: medium
 components: auth, api, database, shared
 ```

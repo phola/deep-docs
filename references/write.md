@@ -12,7 +12,11 @@ code extensively (though it may verify specific details).
 
 ## Per-Component Sub-agent Task
 
-Spawn one per component (dependency order). For small repos, one sub-agent for all.
+Spawn one per component (dependency order).
+
+For small repos (single sub-agent): combine all components into one task. Pass the full
+component list and instruct: "Write L2, L3, and L4 for each of these components in order:
+{{COMPONENT_LIST}}. Use the per-component structure below for each."
 
 ```
 Write documentation for the {{COMPONENT_NAME}} component.
@@ -85,7 +89,11 @@ After all component L4 docs, spawn one sub-agent:
 ```
 Write the L4 system overview for AI agent consumption.
 
-Read: all L4 component docs, diagrams/dependencies.mmd, synthesis scratchpads
+For repos with ≤20 components: read all L4 component docs directly.
+For repos with >20 components: read only the FIRST 20 LINES of each L4 file
+(file inventory table) plus diagrams. The overview is a rollup, not a copy.
+
+Also read: diagrams/dependencies.mmd, synthesis scratchpads
 
 Write {{DOCS_DIR}}/L4/OVERVIEW.md:
 - NO PROSE — headings, tables, and code blocks only

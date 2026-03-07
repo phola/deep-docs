@@ -39,7 +39,7 @@ Skip questions the user has already answered in their initial request.
 
 ## Output
 
-Create the directory structure before writing anything:
+Create the directory structure (orchestrator executes, not the user):
 ```
 mkdir -p {{DOCS_DIR}}/builder/specs
 mkdir -p {{DOCS_DIR}}/builder/.scratch

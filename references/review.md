@@ -2,6 +2,10 @@
 
 Verify all documentation against source code. Fix inaccuracies. Repeat until clean.
 
+## Setup (orchestrator, before spawning any review sub-agents)
+
+Create an empty file: `{{DOCS_DIR}}/builder/.scratch/review-known-issues.md`
+
 ## Principle
 
 The review loop is the quality gate. It runs repeatedly until no errors remain.
@@ -82,8 +86,10 @@ Read:
 - {{DOCS_DIR}}/L2/overview.md
 - {{DOCS_DIR}}/L4/OVERVIEW.md
 - {{DOCS_DIR}}/diagrams/INDEX.md + all .mmd files
-- All per-component review files: {{DOCS_DIR}}/builder/.scratch/review-*.md
-  (Read only ISSUES — skip files that contain only ✅ verified entries)
+- Per-component review files from {{DOCS_DIR}}/builder/.scratch/review-*.md:
+  1. Check each file's final line for COMPONENT_CLEAN or COMPONENT_ISSUES
+  2. Read ONLY files that output COMPONENT_ISSUES
+  3. Skip files that are entirely ✅ verified
 
 Check:
 1. CONSISTENCY — same component names everywhere, no contradictions between L2/L3/L4

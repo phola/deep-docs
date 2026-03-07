@@ -42,7 +42,7 @@ comprehension loops. Documents the **as-is state** — never suggests fixes or i
 | 4 | Comprehend | [comprehend.md](references/comprehend.md) | Per component | None |
 | 5 | Synthesise | [synthesise.md](references/synthesise.md) | 1 | None |
 | 6 | Diagram | [diagram.md](references/diagram.md) | 1 | None |
-| 7 | Write | [write.md](references/write.md) | Per component + 1 | None |
+| 7 | Write | [write.md](references/write.md) | Per component + L2/L4 overviews + L1 | None |
 | 8 | Review | [review.md](references/review.md) | 1 (loops until clean) | ✅ Final approval |
 
 ### update mode
@@ -101,11 +101,17 @@ All source file references in generated docs use paths relative to `{{REPO_PATH}
 - `{{DOCS_REPO_PATH}}` is only used during interview to capture the separate repo path.
   After resolution, all phases use `{{DOCS_DIR}}` exclusively — it is the only output path variable.
 
-## Component Slugs
+## Component Variables
 
 `{{COMPONENT_SLUG}}` = lowercase, hyphen-separated version of the component name.
 Examples: "Auth Module" → `auth-module`, "UserAPI" → `user-api`, "shared/utils" → `shared-utils`.
-Slugs are determined during discover phase and used consistently in all filenames.
+
+`{{COMPONENT_PATH}}` = directory path for the component, relative to repo root.
+Examples: `src/auth`, `packages/api`, `lib/shared/utils`.
+
+`{{COMPONENT_NAME}}` = human-readable name from the component inventory.
+
+All three are determined during discover phase and recorded in component-inventory.md.
 
 ## Scratchpad Convention
 

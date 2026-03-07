@@ -153,3 +153,6 @@ Fix any inaccuracies. Output REVIEW_CLEAN or REVIEW_ISSUES: N unresolved.
 ```
 
 Loop up to 3 iterations, same as init mode.
+
+Note: history mode does NOT update `last-run.md` — it is a read-only analysis
+that produces a changelog without affecting future update runs.
