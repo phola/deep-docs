@@ -69,11 +69,12 @@ spawn_agent() {
   # Use a unique session per sub-agent spawn
   local session_id="deep-docs-${label}-$(date +%s)"
 
+  # Run agent and discard output — we verify by checking output files
   openclaw agent \
     --session-id "$session_id" \
     --message "$task" \
     --timeout "$agent_timeout" \
-    --json 2>&1 | jq -r '.content // .error // "no output"' 2>/dev/null || echo "agent error"
+    > /dev/null 2>&1 || true
 }
 
 # ============================================================
