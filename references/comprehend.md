@@ -9,7 +9,26 @@ understanding before any writing.
 No documentation is written in this phase. Only scratchpad notes.
 The goal is to build understanding that will make the write phase accurate and insightful.
 
-## Sub-agent Task Template
+## Sub-agent Strategy
+
+**Small/Medium profiles:** One sub-agent per component runs all loops in a single session.
+
+**Large profile OR any component with >30 source files:** Split into per-loop sub-agents.
+Each loop is a separate sub-agent that reads the previous loop's scratchpad output.
+This prevents context overflow for large components.
+
+Per-loop sub-agent chain:
+```
+Loop 1 agent → writes 01-inventory.md
+Loop 2 agent → reads 01-inventory.md → writes 02-data.md
+Loop 3 agent → reads 01+02 → writes 03-functions.md
+...each loop reads ALL prior loop outputs for this component
+```
+
+The orchestrator spawns loop agents sequentially per component (not parallel — each
+depends on the previous). Different components CAN run in parallel at the same loop level.
+
+## Sub-agent Task Template (single-agent mode: small/medium)
 
 Spawn one sub-agent per component (in dependency order from calibration):
 
@@ -131,6 +150,36 @@ After ALL loops, write a summary scratchpad:
 
 {{HARD_RULES}}
 ```
+
+## Per-Loop Sub-agent Template (large profile / >30 source files)
+
+For each loop, spawn a separate sub-agent:
+
+```
+You are studying the {{COMPONENT_NAME}} component of a codebase at {{REPO_PATH}}.
+This is loop {{LOOP_NUMBER}} of {{TOTAL_LOOPS}}.
+
+Read:
+- {{DOCS_DIR}}/builder/specs/component-inventory.md (your component's entry)
+- Previous loop outputs for THIS component:
+  {{PRIOR_LOOP_SCRATCHPADS}}
+- Dependency summaries: {{SCRATCH_FILES}}
+- Source code at {{COMPONENT_PATH}}
+
+Run ONLY this loop:
+{{LOOP_INSTRUCTIONS}}
+
+Write scratchpad to: {{SCRATCHPAD_PATH}}
+
+{{HARD_RULES}}
+```
+
+ORCHESTRATOR: for each loop, extract the matching LOOP block from the profile section
+above and pass it as `{{LOOP_INSTRUCTIONS}}`. Set `{{PRIOR_LOOP_SCRATCHPADS}}` to all
+scratchpad files from earlier loops of this component (or "None — first loop" for loop 1).
+
+After all loops complete, spawn one final sub-agent to write the summary scratchpad
+(same as single-agent mode — reads all loop outputs, writes comprehend-{{COMPONENT_SLUG}}-summary.md).
 
 ## Scratchpad Format
 

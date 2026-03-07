@@ -127,8 +127,9 @@ See [calibrate.md](references/calibrate.md). Auto-selected based on repo size.
 | | Small (<20 files) | Medium (20-100) | Large (100+) |
 |---|---|---|---|
 | Comprehend loops | 3 (collapsed) | 5 | 7 (full) |
-| Synthesise passes | 1 | 2 | 3 |
-| Build sub-agents | 1 (all components) | Per component (sequential) | Per component (parallel where safe) |
+| Loop agents | Single agent/component | Single (per-loop if >30 files) | Per-loop agents |
+| Synthesise passes | 1 | 2 | 3 (batched if >20 components) |
+| Write sub-agents | 1 (all components) | Per component (sequential) | Per component (parallel where safe) |
 
 ## Error Handling
 

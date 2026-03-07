@@ -13,17 +13,21 @@ and selects a calibration profile.
 ### Small (< 20 source files, ≤ 5 components)
 
 3 comprehension loops (see [comprehend.md](comprehend.md) SMALL PROFILE for details).
+Single-agent mode (all loops in one sub-agent per component).
 Synthesise: 1 pass. Write: single sub-agent for all components.
 
 ### Medium (20-100 source files, 6-15 components)
 
 5 comprehension loops (see [comprehend.md](comprehend.md) MEDIUM PROFILE for details).
+Single-agent mode by default. Components with >30 source files escalate to per-loop mode.
 Synthesise: 2 passes. Write: one sub-agent per component (sequential).
 
 ### Large (100+ source files, 15+ components)
 
 7 comprehension loops (see [comprehend.md](comprehend.md) LARGE PROFILE for details).
-Synthesise: 3 passes. Write: per component, parallel where no dependency conflict.
+Per-loop sub-agent mode (each loop is a separate agent reading prior loop outputs).
+Components with ≤30 source files may use single-agent mode to reduce overhead.
+Synthesise: 3 passes (batched if >20 components). Write: per component, parallel where no dependency conflict.
 
 **Parallel grouping algorithm:** Group components into dependency levels.
 Level 0 = components with no dependencies on other project components.
