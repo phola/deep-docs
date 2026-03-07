@@ -18,7 +18,8 @@ Explore the repository at {{REPO_PATH}} thoroughly:
 2. COMPONENT DETECTION
    - Identify logical components (not just directories): services, pipelines, libraries,
      CLI tools, APIs, shared modules, infrastructure config
-   - For each component note: directory, primary language, entry points, rough purpose
+   - For each component note: directory, SOURCE FILE COUNT (excluding tests, configs, assets),
+     primary language, entry points, rough purpose
    - Detect dependencies between components (imports, shared modules, config references)
 
 3. EXISTING DOCS
@@ -44,10 +45,10 @@ OUTPUT two files:
 - Components in dependency order (foundations first)
 - Use this table format:
 
-| # | Component | Slug | Path | Language | Purpose | Key Files | Dependencies |
-|---|-----------|------|------|----------|---------|-----------|--------------|
-| 1 | Shared Utils | shared-utils | src/shared | Python | Common helpers | utils.py, config.py | (none) |
-| 2 | Auth | auth | src/auth | Python | Authentication | auth.py, models.py | shared-utils |
+| # | Component | Slug | Path | Source Files | Language | Purpose | Key Files | Dependencies |
+|---|-----------|------|------|-------------|----------|---------|-----------|--------------|
+| 1 | Shared Utils | shared-utils | src/shared | 8 | Python | Common helpers | utils.py, config.py | (none) |
+| 2 | Auth | auth | src/auth | 34 | Python | Authentication | auth.py, models.py | shared-utils |
 
 - Mark any components that are unclear or need deeper investigation
 

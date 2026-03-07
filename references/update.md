@@ -35,7 +35,12 @@ For MODIFIED items, note specifically what changed (not just "file was modified"
 what functions, schemas, behaviours differ).
 
 List affected components in dependency order.
+
+If NO changes detected (all components UNCHANGED): output NO_CHANGES_DETECTED.
 ```
+
+If diff discovery outputs `NO_CHANGES_DETECTED`, inform the user that docs are up to date
+and exit without spawning further sub-agents.
 
 ### 2. Targeted Comprehension
 

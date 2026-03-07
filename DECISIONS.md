@@ -86,6 +86,18 @@ Record of key design decisions for the deep-docs skill.
 
 **Rationale:** Fully granular (per-loop agents for everything) creates too much orchestration overhead for small repos. But large components with 50+ files can't fit 7 loops in one session. Middle ground: automatic escalation when a component is too large for single-agent comprehension.
 
+## 2026-03-07: Error handling — retry once, skip on second failure
+
+**Decision:** Failed sub-agents get one retry. If they fail again, skip the component and continue. Discover/calibrate failures abort the run.
+
+**Rationale:** Don't let one problematic component block documentation of the entire repo. Skipped components are noted so the user knows what's missing.
+
+## 2026-03-07: Diagrams as a dedicated phase
+
+**Decision:** Generate all diagrams in a dedicated phase between synthesis and writing, rather than inline during writing.
+
+**Rationale:** Diagrams require cross-component understanding (from synthesis). Generating them once ensures consistency across all docs. Write-phase agents embed from the canonical .mmd files rather than each inventing their own.
+
 ## 2026-03-07: History mode epoch detection
 
 **Decision:** Group git history into meaningful epochs (not 1:1 with commits) using signals like new directories, large refactors, activity gaps, and tag boundaries.

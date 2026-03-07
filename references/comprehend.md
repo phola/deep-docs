@@ -175,8 +175,12 @@ Write scratchpad to: {{SCRATCHPAD_PATH}}
 ```
 
 ORCHESTRATOR: for each loop, extract the matching LOOP block from the profile section
-above and pass it as `{{LOOP_INSTRUCTIONS}}`. Set `{{PRIOR_LOOP_SCRATCHPADS}}` to all
-scratchpad files from earlier loops of this component (or "None — first loop" for loop 1).
+above and pass it as `{{LOOP_INSTRUCTIONS}}`. The `→ scratchpad:` notation in the loop
+block is context for the agent; the authoritative output path is `{{SCRATCHPAD_PATH}}`.
+
+Construct `{{PRIOR_LOOP_SCRATCHPADS}}` as a newline-separated list of paths to all
+scratchpad files from earlier loops of this component. For loop 1, pass the literal
+string: "None — first loop."
 
 After all loops complete, spawn one final sub-agent to write the summary scratchpad
 (same as single-agent mode — reads all loop outputs, writes comprehend-{{COMPONENT_SLUG}}-summary.md).
