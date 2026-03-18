@@ -470,6 +470,442 @@ ${HARD_RULES}"
 }
 
 # ============================================================
+# PHASE: diff_discovery (update mode)
+# ============================================================
+phase_diff_discovery() {
+  log "DIFF_DISCOVERY — started"
+
+  local last_run_date=""
+  local last_run_file="${DOCS_DIR}/builder/last-run.md"
+  if [[ -f "$last_run_file" ]]; then
+    last_run_date=$(grep '^date:' "$last_run_file" | sed 's/^date: *//' | xargs)
+    log "DIFF_DISCOVERY — last run: ${last_run_date}"
+  else
+    log "DIFF_DISCOVERY — no last-run.md found, comparing docs vs current source directly"
+  fi
+
+  local git_context=""
+  if [[ -n "$last_run_date" ]]; then
+    git_context="Run \`git log --oneline --since='${last_run_date}' -- .\` in ${REPO_PATH} to see what changed since last docs run.
+Also run \`git diff --name-status \$(git log --since='${last_run_date}' --format=%H -- . | tail -1)..HEAD -- .\` for a file-level diff."
+  else
+    git_context="No previous run date available. Compare existing L4 docs against current source code to detect drift."
+  fi
+
+  local task="You are running DIFF DISCOVERY for a documentation update.
+
+Compare the current source code against existing documentation.
+
+Read:
+- ${INVENTORY} (what was documented)
+- All L4 docs in ${DOCS_DIR}/L4/ (most precise inventory of what was documented)
+- ${last_run_file} (if it exists — contains date of last run)
+
+${git_context}
+
+Produce ${SCRATCH}/update-diff.md with this structure:
+
+## Summary
+- Total components: N
+- Changed: N (NEW: N, MODIFIED: N, REMOVED: N, STRUCTURAL: N)
+- Unchanged: N
+
+## Affected Components
+| Slug | Classification | What Changed |
+|------|---------------|--------------|
+| ... | NEW/MODIFIED/REMOVED/STRUCTURAL | Specific description |
+
+## Unchanged Components
+| Slug | Status |
+|------|--------|
+| ... | UNCHANGED |
+
+## Detail
+For each MODIFIED component, describe specifically what changed:
+- Which functions/schemas/behaviours differ
+- Which source files were added/removed/modified
+
+For each change, classify as:
+- NEW: files/components that exist in source but not in docs
+- MODIFIED: source files whose behaviour no longer matches L4 description
+- REMOVED: documented items that no longer exist in source
+- STRUCTURAL: renames, moves, reorganisation
+- UNCHANGED: components where docs still match source
+
+List affected components in dependency order.
+
+If NO changes detected (all components UNCHANGED): output NO_CHANGES_DETECTED as the final line.
+
+${HARD_RULES}"
+
+  spawn_agent "$task" "diff-discovery" 600 "$(model_for economy)" > /dev/null
+
+  if [[ -f "${SCRATCH}/update-diff.md" ]]; then
+    if grep -q "NO_CHANGES_DETECTED" "${SCRATCH}/update-diff.md" 2>/dev/null; then
+      log "DIFF_DISCOVERY — complete: NO_CHANGES_DETECTED"
+      return 1  # Signal no changes
+    fi
+    local affected
+    affected=$(grep -cE '^\| .+ \| (NEW|MODIFIED|REMOVED|STRUCTURAL)' "${SCRATCH}/update-diff.md" 2>/dev/null || echo "0")
+    log "DIFF_DISCOVERY — complete (${affected} affected components)"
+    return 0
+  else
+    log "DIFF_DISCOVERY — ❌ failed (no update-diff.md produced)"
+    exit 1
+  fi
+}
+
+# Parse affected component slugs from update-diff.md
+# Returns pipe-delimited lines: slug|classification
+parse_affected_components() {
+  /usr/bin/awk -F'|' '/^\| .+ \| (NEW|MODIFIED|REMOVED|STRUCTURAL)/ {
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);  # slug
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);  # classification
+    if ($2 != "" && $2 != "Slug") print $2 "|" $3
+  }' "${SCRATCH}/update-diff.md"
+}
+
+# Check if a slug is in the affected list
+is_affected() {
+  local slug="$1"
+  parse_affected_components | grep -q "^${slug}|"
+}
+
+# Get classification for a slug
+get_classification() {
+  local slug="$1"
+  parse_affected_components | grep "^${slug}|" | head -1 | cut -d'|' -f2
+}
+
+# ============================================================
+# PHASE: update_comprehend (update mode)
+# ============================================================
+phase_update_comprehend() {
+  local affected_count
+  affected_count=$(parse_affected_components | grep -cE '\|(NEW|MODIFIED)$' || echo "0")
+  log "UPDATE_COMPREHEND — started (${affected_count} components to re-comprehend)"
+
+  if (( affected_count == 0 )); then
+    log "UPDATE_COMPREHEND — skipped (no NEW or MODIFIED components)"
+    return
+  fi
+
+  local total
+  total=$(count_components)
+  local i=0
+
+  parse_components | while IFS='|' read -r slug name path files; do
+    i=$((i + 1))
+
+    local classification
+    classification=$(get_classification "$slug")
+
+    # Only comprehend NEW and MODIFIED components
+    if [[ "$classification" != "NEW" && "$classification" != "MODIFIED" ]]; then
+      continue
+    fi
+
+    # Resume support
+    if [[ -f "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
+      log "UPDATE_COMPREHEND/${slug} — skipped (summary exists)"
+      continue
+    fi
+
+    local files_int="${files//[^0-9]/}"
+    files_int="${files_int:-0}"
+
+    # Minimal packages
+    if (( files_int <= 3 )); then
+      log "UPDATE_COMPREHEND/${slug} — started (minimal package, ${classification})"
+
+      local mini_task="You are re-studying the '${name}' component at ${REPO_PATH}/${path} for a documentation UPDATE.
+This is a minimal/config-only package with ${files_int} source files.
+Classification: ${classification}
+
+Read:
+- The change details from ${SCRATCH}/update-diff.md (find your component)
+- All source files in the component directory
+- Previous comprehension summary: ${SCRATCH}/comprehend-${slug}-summary.md (if it exists)
+
+Write a brief updated summary scratchpad to:
+${SCRATCH}/update-comprehend-${slug}-summary.md
+
+Focus on what CHANGED since the last documentation run.
+Keep the summary under 50 lines.
+
+${HARD_RULES}"
+
+      spawn_agent "$mini_task" "update-comprehend-${slug}" "$TIMEOUT" "$(model_for economy)" > /dev/null
+
+      if [[ -f "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
+        log "UPDATE_COMPREHEND/${slug} — complete (minimal)"
+      else
+        log "UPDATE_COMPREHEND/${slug} — ❌ SKIPPED"
+        echo "- ${name} (${slug}): update comprehend failed" >> "${DOCS_DIR}/builder/skipped-components.md"
+      fi
+      continue
+    fi
+
+    local mode="single-agent"
+    if (( files_int > 30 )); then
+      mode="per-loop (${files_int} files)"
+    fi
+
+    log "UPDATE_COMPREHEND/${slug} — started (${mode}, ${classification})"
+
+    local task="You are re-studying the '${name}' component of a codebase at ${REPO_PATH} for a documentation UPDATE.
+Your job is to BUILD UNDERSTANDING of what CHANGED. Do NOT write documentation.
+
+Read these first:
+- ${SCRATCH}/update-diff.md (find your component — what changed)
+- ${DOCS_DIR}/builder/interview-notes.md (user context)
+- ${INVENTORY} (find your component's entry)
+- Previous comprehension summary: ${SCRATCH}/comprehend-${slug}-summary.md (if it exists — this is your baseline)
+
+Component path: ${REPO_PATH}/${path}
+Component slug: ${slug}
+Classification: ${classification}
+
+Read the comprehension loop instructions at ${SKILL_DIR}/references/comprehend.md.
+Based on the file count (${files} source files), use the appropriate profile:
+- ≤30 files: SMALL PROFILE (3 loops)
+- >30 files: LARGE PROFILE (7 loops)
+
+FOCUS: You are updating, not starting from scratch. Pay attention to:
+- What is NEW or DIFFERENT compared to the previous summary
+- Changed function signatures, schemas, behaviours
+- New dependencies or removed dependencies
+- Changed error handling or data flows
+
+After ALL loops, write an UPDATED summary scratchpad to:
+${SCRATCH}/update-comprehend-${slug}-summary.md
+
+Include a 'Changes Since Last Run' section at the top.
+
+${HARD_RULES}"
+
+    local result
+    result=$(spawn_agent "$task" "update-comprehend-${slug}" "$TIMEOUT" "$(model_for high)")
+
+    if [[ -f "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
+      log "UPDATE_COMPREHEND/${slug} — complete"
+    else
+      log "UPDATE_COMPREHEND/${slug} — ❌ no summary produced, retrying"
+      result=$(spawn_agent "$task" "update-comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)")
+      if [[ -f "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
+        log "UPDATE_COMPREHEND/${slug} — complete on retry"
+      else
+        log "UPDATE_COMPREHEND/${slug} — ❌ SKIPPED after retry"
+        echo "- ${name} (${slug}): update comprehend failed after 2 attempts" >> "${DOCS_DIR}/builder/skipped-components.md"
+      fi
+    fi
+  done
+
+  local summaries
+  summaries=$(find "$SCRATCH" -name "update-comprehend-*-summary.md" 2>/dev/null | wc -l | xargs)
+  log "UPDATE_COMPREHEND — complete (${summaries} summaries)"
+}
+
+# ============================================================
+# PHASE: update_docs (update mode)
+# ============================================================
+phase_update_docs() {
+  local affected_count
+  affected_count=$(parse_affected_components | wc -l | xargs)
+  log "UPDATE_DOCS — started (${affected_count} affected components)"
+
+  local total
+  total=$(count_components)
+  local i=0
+  local updated=0
+  local has_system_changes=false
+
+  parse_components | while IFS='|' read -r slug name path files; do
+    i=$((i + 1))
+
+    local classification
+    classification=$(get_classification "$slug")
+
+    # Skip unchanged
+    if [[ -z "$classification" || "$classification" == "UNCHANGED" ]]; then
+      continue
+    fi
+
+    case "$classification" in
+      REMOVED)
+        log "UPDATE_DOCS/${slug} — removing docs (${classification})"
+        rm -f "${DOCS_DIR}/L2/${slug}.md" "${DOCS_DIR}/L3/${slug}.md" "${DOCS_DIR}/L4/${slug}.md"
+        log "UPDATE_DOCS/${slug} — removed L2/L3/L4"
+        has_system_changes=true
+        ;;
+      NEW)
+        log "UPDATE_DOCS/${slug} — writing new docs (${classification}, ${i}/${total})"
+
+        # Use the same full write task as init mode
+        local comprehend_file="${SCRATCH}/update-comprehend-${slug}-summary.md"
+        if [[ ! -f "$comprehend_file" ]]; then
+          comprehend_file="${SCRATCH}/comprehend-${slug}-summary.md"
+        fi
+
+        local task="Write documentation for the NEW '${name}' component.
+
+Read these inputs:
+- ${comprehend_file} (comprehension summary)
+- Source code at ${REPO_PATH}/${path} (for verification)
+
+Write THREE files:
+
+${DOCS_DIR}/L2/${slug}.md
+- Audience: BAs, PMs, non-engineers
+- What this component does and why it exists
+- Data flows with mermaid diagrams
+- Business rules and logic in plain language
+
+${DOCS_DIR}/L3/${slug}.md
+- Audience: developers, maintainers
+- Architecture and design decisions
+- Code structure with file references
+- Patterns, configuration, error handling, gotchas
+
+${DOCS_DIR}/L4/${slug}.md
+- Audience: AI agents
+- NO PROSE — headings, tables, and code blocks only
+- File inventory, function signatures, schemas
+
+${HARD_RULES}"
+
+        spawn_agent "$task" "update-write-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
+
+        local written=0
+        [[ -f "${DOCS_DIR}/L2/${slug}.md" ]] && written=$((written + 1))
+        [[ -f "${DOCS_DIR}/L3/${slug}.md" ]] && written=$((written + 1))
+        [[ -f "${DOCS_DIR}/L4/${slug}.md" ]] && written=$((written + 1))
+        log "UPDATE_DOCS/${slug} — complete (${written}/3 files written)"
+        has_system_changes=true
+        ;;
+      MODIFIED|STRUCTURAL)
+        log "UPDATE_DOCS/${slug} — updating docs (${classification}, ${i}/${total})"
+
+        local comprehend_file="${SCRATCH}/update-comprehend-${slug}-summary.md"
+        if [[ ! -f "$comprehend_file" ]]; then
+          comprehend_file="${SCRATCH}/comprehend-${slug}-summary.md"
+        fi
+
+        local task="SURGICALLY update documentation for '${name}' based on detected changes.
+Classification: ${classification}
+
+Read:
+- ${SCRATCH}/update-diff.md (what changed for this component)
+- ${comprehend_file} (fresh comprehension notes)
+- Existing docs:
+  - ${DOCS_DIR}/L2/${slug}.md
+  - ${DOCS_DIR}/L3/${slug}.md
+  - ${DOCS_DIR}/L4/${slug}.md
+- Source code at ${REPO_PATH}/${path} (for verification)
+
+IMPORTANT:
+- Do NOT rewrite from scratch. Update ONLY the sections affected by the changes.
+- Preserve sections marked with <!-- HUMAN --> ... <!-- /HUMAN --> VERBATIM.
+  These are human-authored additions that must not be overwritten.
+- All other content is deep-docs generated and may be updated freely.
+- For STRUCTURAL changes: update paths and references throughout.
+- For MODIFIED changes: update the specific sections that describe changed behaviour.
+- Add a <!-- UPDATED: $(date -u +%Y-%m-%dT%H:%M:%SZ) --> comment at the top of each updated file.
+
+${HARD_RULES}"
+
+        spawn_agent "$task" "update-write-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
+        log "UPDATE_DOCS/${slug} — complete"
+        ;;
+    esac
+    updated=$((updated + 1))
+  done
+
+  # Regenerate overviews and L1 if there were system-level changes
+  if [[ "$has_system_changes" == "true" ]] || (( updated > 0 )); then
+    log "UPDATE_DOCS/overviews — regenerating"
+
+    spawn_agent "Update the system-level L2 overview. Read all L2 docs in ${DOCS_DIR}/L2/ and the change summary in ${SCRATCH}/update-diff.md. Update ${DOCS_DIR}/L2/overview.md to reflect current state. Preserve <!-- HUMAN --> blocks. ${HARD_RULES}" "update-l2-overview" "$TIMEOUT" "$(model_for high)" > /dev/null
+    log "UPDATE_DOCS/L2/overview.md — updated"
+
+    spawn_agent "Update the L4 system overview. Read L4 files in ${DOCS_DIR}/L4/ plus ${DOCS_DIR}/diagrams/dependencies.mmd. Update ${DOCS_DIR}/L4/OVERVIEW.md. NO PROSE. ${HARD_RULES}" "update-l4-overview" "$TIMEOUT" "$(model_for high)" > /dev/null
+    log "UPDATE_DOCS/L4/OVERVIEW.md — updated"
+
+    spawn_agent "Update the executive summary. Read L2 docs in ${DOCS_DIR}/L2/ and ${SCRATCH}/update-diff.md. Update ${DOCS_DIR}/L1/executive-summary.md. 1 page max, no code, no jargon. ${HARD_RULES}" "update-l1" "$TIMEOUT" "$(model_for high)" > /dev/null
+    log "UPDATE_DOCS/L1/executive-summary.md — updated"
+  fi
+
+  log "UPDATE_DOCS — complete (${updated} components updated)"
+}
+
+# ============================================================
+# PHASE: changelog (update mode)
+# ============================================================
+phase_changelog() {
+  log "CHANGELOG — started"
+
+  local task="Generate a changelog entry for this documentation update.
+
+Read:
+- ${SCRATCH}/update-diff.md (what changed in source code)
+- All update comprehension notes: ${SCRATCH}/update-comprehend-*-summary.md
+- The current docs in ${DOCS_DIR}/L2/ and ${DOCS_DIR}/L3/ (to see what was updated)
+
+Write a changelog entry. If ${DOCS_DIR}/CHANGELOG.md exists, PREPEND the new entry
+after the title line. If it doesn't exist, create it.
+
+Use this format:
+
+## $(date -u +%Y-%m-%d)
+
+### Code Changes Detected
+- Bullet list of meaningful source changes (not every file — grouped logically)
+
+### Documentation Updates
+- What was added/updated/removed in docs
+- Which components were re-documented
+- Which diagrams were regenerated (if any)
+
+### Impact Summary
+- 1-2 sentences: what this means for users of the codebase
+
+${HARD_RULES}"
+
+  spawn_agent "$task" "changelog" "$TIMEOUT" "$(model_for high)" > /dev/null
+
+  if [[ -f "${DOCS_DIR}/CHANGELOG.md" ]]; then
+    log "CHANGELOG — complete"
+  else
+    log "CHANGELOG — ❌ no CHANGELOG.md produced"
+  fi
+}
+
+# ============================================================
+# PHASE: record (write last-run.md)
+# ============================================================
+phase_record() {
+  local mode="${1:-init}"
+  local components_list
+
+  if [[ "$mode" == "update" ]]; then
+    components_list=$(parse_affected_components | cut -d'|' -f1 | paste -sd', ' -)
+  else
+    components_list=$(parse_components | cut -d'|' -f1 | paste -sd', ' -)
+  fi
+
+  local profile="large"  # Default; could be read from calibration.md if it existed
+
+  cat > "${DOCS_DIR}/builder/last-run.md" << EOF
+date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+mode: ${mode}
+profile: ${profile}
+components: ${components_list}
+EOF
+
+  log "RECORD — last-run.md written (mode: ${mode})"
+}
+
+# ============================================================
 # Main
 # ============================================================
 case "$PHASE" in
@@ -506,12 +942,59 @@ case "$PHASE" in
 
     phase_write
     phase_review
+    phase_record "init"
 
     log "COMPLETE — deep-docs init finished"
     ;;
+  update)
+    # Diff discovery — detect what changed
+    if ! phase_diff_discovery; then
+      log "COMPLETE — no changes detected, docs are up to date"
+      exit 0
+    fi
+
+    # Targeted comprehension for affected components
+    phase_update_comprehend
+
+    # Re-synthesise if integration points changed
+    local needs_synthesis=false
+    if parse_affected_components | grep -qE '\|(NEW|REMOVED)$'; then
+      needs_synthesis=true
+    fi
+    # Also re-synthesise if >3 components modified (likely cross-cutting change)
+    local modified_count
+    modified_count=$(parse_affected_components | grep -c '|MODIFIED$' || echo "0")
+    if (( modified_count > 3 )); then
+      needs_synthesis=true
+    fi
+
+    if [[ "$needs_synthesis" == "true" ]]; then
+      log "SYNTHESISE — started (integration points changed)"
+      spawn_agent "Read ${SKILL_DIR}/references/synthesise.md. Read all summary scratchpads from ${SCRATCH}/update-comprehend-*-summary.md and ${SCRATCH}/comprehend-*-summary.md. Read ${INVENTORY}. Write synthesis files to ${SCRATCH}/synthesise-01-integration.md, synthesise-02-flows.md, synthesise-03-architecture.md. Focus on what CHANGED. ${HARD_RULES}" "update-synthesise" "$TIMEOUT" "$(model_for high)" > /dev/null
+      log "SYNTHESISE — complete"
+
+      log "DIAGRAM — started (updating)"
+      spawn_agent "Read ${SKILL_DIR}/references/diagram.md. Read synthesis notes from ${SCRATCH}/synthesise-*.md and ${INVENTORY}. Update Mermaid diagrams in ${DOCS_DIR}/diagrams/. Update ${DOCS_DIR}/diagrams/INDEX.md. ${HARD_RULES}" "update-diagram" "$TIMEOUT" "$(model_for economy)" > /dev/null
+      log "DIAGRAM — complete"
+    fi
+
+    # Surgical doc updates
+    phase_update_docs
+
+    # Changelog
+    phase_changelog
+
+    # Review (same as init — verifies all updated docs)
+    phase_review
+
+    # Record last run
+    phase_record "update"
+
+    log "COMPLETE — deep-docs update finished"
+    ;;
   *)
     echo "Unknown phase: $PHASE"
-    echo "Usage: orchestrate.sh <discover|comprehend|write|review|all> <repo_path> <docs_dir> [model]"
+    echo "Usage: orchestrate.sh <discover|comprehend|write|review|update|all> <repo_path> <docs_dir> [model]"
     exit 1
     ;;
 esac
