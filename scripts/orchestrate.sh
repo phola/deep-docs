@@ -9,7 +9,7 @@ set -uo pipefail
 # The script reads component-inventory.md, loops through each component,
 # and spawns one OpenClaw sub-agent per component.
 
-PHASE="${1:?Usage: orchestrate.sh <phase> <repo_path> <docs_dir> [model]}"
+PHASE="${1:?Usage: orchestrate.sh <phase> <repo_path> <docs_dir> [model] [-- history options]}"
 REPO_PATH="${2:?Missing repo_path}"
 DOCS_DIR="${3:?Missing docs_dir}"
 MODEL="${4:-anthropic/claude-opus-4-6}"
