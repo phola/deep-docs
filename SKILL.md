@@ -129,8 +129,10 @@ All source file references in generated docs use paths relative to `{{REPO_PATH}
 
 ## Component Variables
 
-`{{COMPONENT_SLUG}}` = lowercase, hyphen-separated version of the component name.
-Examples: "Auth Module" → `auth-module`, "UserAPI" → `user-api`, "shared/utils" → `shared-utils`.
+`{{COMPONENT_SLUG}}` = lowercase, **hyphen-separated** version of the component name.
+MUST use hyphens (not underscores). Strip `@scope/` prefixes.
+Examples: "Auth Module" → `auth-module`, "UserAPI" → `user-api`, "shared/utils" → `shared-utils`,
+`@buzz/eslint-configs` → `buzz-eslint-configs`, `image_orders_fun_api` → `image-orders-fun-api`.
 
 `{{COMPONENT_PATH}}` = directory path for the component, relative to repo root.
 Examples: `src/auth`, `packages/api`, `lib/shared/utils`.
