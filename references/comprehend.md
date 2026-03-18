@@ -13,6 +13,41 @@ CRITICAL: The orchestrator MUST loop through EVERY component and spawn a sub-age
 each one. Verify each component produces a summary scratchpad before marking complete.
 Do not delegate "comprehend all components" to a single sub-agent.
 
+## Minimal / Config-only Packages
+
+Some components are thin wrappers or config-only packages (e.g. shared ESLint configs,
+esbuild plugins, resource naming conventions). These have very few source files (often
+just an index.js/ts re-exporting config objects) and no business logic to study.
+
+Detection: Source file count ≤ 3 AND total lines across all source files < 100.
+
+For these packages, skip the full comprehension loop. Instead, spawn a single sub-agent
+with a simplified task:
+
+```
+You are studying the {{COMPONENT_NAME}} component at {{COMPONENT_PATH}}.
+This is a minimal/config-only package with {{FILE_COUNT}} source files.
+
+Read all source files in the component directory.
+Write a brief summary scratchpad to:
+{{SCRATCH}}/comprehend-{{COMPONENT_SLUG}}-summary.md
+
+Include:
+- What the package exports (list each export)
+- What config/conventions it enforces
+- Which other packages consume it (check dependents in component-inventory.md)
+- Any version constraints or peer dependencies
+
+This is a THIN PACKAGE — do not run multiple comprehension loops.
+Keep the summary under 50 lines.
+
+{{HARD_RULES}}
+```
+
+The orchestrator detects minimal packages by checking the Source Files column in
+component-inventory.md. If ≤ 3 files, it uses the minimal template above instead
+of the full loop-based comprehension.
+
 ## Sub-agent Strategy
 
 **Small/Medium profiles:** One sub-agent per component runs all loops in a single session.

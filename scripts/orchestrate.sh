@@ -118,9 +118,43 @@ phase_comprehend() {
       continue
     fi
 
-    local mode="single-agent"
     local files_int="${files//[^0-9]/}"
     files_int="${files_int:-0}"
+
+    # Minimal/config-only packages: ≤3 source files → simplified single-pass comprehension
+    if (( files_int <= 3 )); then
+      log "COMPREHEND/${slug} — started (minimal package, ${files_int} files, ${i}/${total})"
+
+      local mini_task="You are studying the '${name}' component at ${REPO_PATH}/${path}.
+This is a minimal/config-only package with ${files_int} source files.
+
+Read all source files in the component directory.
+Write a brief summary scratchpad to:
+${SCRATCH}/comprehend-${slug}-summary.md
+
+Include:
+- What the package exports (list each export)
+- What config/conventions it enforces
+- Which other packages consume it (check dependents in ${INVENTORY})
+- Any version constraints or peer dependencies
+
+This is a THIN PACKAGE — do not run multiple comprehension loops.
+Keep the summary under 50 lines.
+
+${HARD_RULES}"
+
+      spawn_agent "$mini_task" "comprehend-${slug}" "$TIMEOUT" "$(model_for economy)" > /dev/null
+
+      if [[ -f "${SCRATCH}/comprehend-${slug}-summary.md" ]]; then
+        log "COMPREHEND/${slug} — complete (minimal, ${i}/${total})"
+      else
+        log "COMPREHEND/${slug} — ❌ SKIPPED minimal package (${i}/${total})"
+        echo "- ${name} (${slug}): minimal package, no summary produced" >> "${DOCS_DIR}/builder/skipped-components.md"
+      fi
+      continue
+    fi
+
+    local mode="single-agent"
     if (( files_int > 30 )); then
       mode="per-loop (${files_int} files)"
     fi
@@ -295,7 +329,13 @@ Exclusions: node_modules, bin, obj, dist, .git, __pycache__, .vscode, plus any f
 
 1. INVENTORY — Walk the entire file tree (respecting exclusions). Catalogue languages, frameworks, package managers. Count files per directory.
 
-2. COMPONENT DETECTION — Identify logical components at the PACKAGE level (not module level). Each independently-packaged library, API, UI app, or infrastructure stack is its own component. For each: directory, SOURCE FILE COUNT, language, entry points, purpose. Detect inter-component dependencies.
+2. COMPONENT DETECTION — Component boundaries MUST be structural, not judgement-based:
+   a) PACKAGE-MANAGER ANCHORED: Run \`find ${REPO_PATH} -name 'package.json' -o -name 'Cargo.toml' -o -name 'pyproject.toml' -o -name 'go.mod' -o -name '*.csproj' -o -name 'pom.xml'\` (excluding node_modules etc). Each match = one component.
+   b) MONOREPO WORKSPACES: If root defines workspaces (package.json workspaces, pnpm-workspace.yaml, Cargo workspace), enumerate every workspace entry. Each = one component.
+   c) INFRASTRUCTURE: Directories with Dockerfile, Bicep/ARM, Terraform/CDKTF, or CI pipelines = components (unless inside a package from rule a).
+   d) FALLBACK: If no package managers, each top-level source directory = one component.
+   DETERMINISM: Use find/ls to enumerate exhaustively. Do NOT sample. Same repo state must produce the same components on every run.
+   For each: directory, SOURCE FILE COUNT, language, entry points, purpose. Detect inter-component dependencies.
 
 3. EXISTING DOCS — Find .md files, doc comments, OpenAPI specs. Assess quality.
 

@@ -16,11 +16,30 @@ Explore the repository at {{REPO_PATH}} thoroughly:
    - Count files and lines per directory to assess size
 
 2. COMPONENT DETECTION
-   - Identify logical components (not just directories): services, pipelines, libraries,
-     CLI tools, APIs, shared modules, infrastructure config
-   - For each component note: directory, SOURCE FILE COUNT (excluding tests, configs, assets),
-     primary language, entry points, rough purpose
-   - Detect dependencies between components (imports, shared modules, config references)
+   Component boundaries MUST be determined by structural markers, not judgement:
+
+   a) **Package-manager anchored** (preferred): Each directory containing a package.json,
+      Cargo.toml, pyproject.toml, go.mod, *.csproj, pom.xml, or equivalent is ONE component.
+      Do not merge multiple packages into one component. Do not split a single package into
+      multiple components.
+
+   b) **Monorepo workspaces**: If a root package.json/Cargo.toml/pnpm-workspace.yaml defines
+      workspaces, enumerate them explicitly. Every workspace entry = one component.
+
+   c) **Infrastructure-as-code**: Each directory with a Dockerfile, Bicep/ARM template,
+      Terraform/CDKTF config, or CI pipeline definition is a component (unless it's already
+      inside a package from rule a).
+
+   d) **Fallback** (no package managers): Group by top-level directories that contain source
+      files. Each top-level source directory = one component.
+
+   For each component note: directory, SOURCE FILE COUNT (excluding tests, configs, assets),
+   primary language, entry points, rough purpose.
+   Detect dependencies between components (imports, shared modules, config references).
+
+   DETERMINISM RULE: Run `find` or `ls` commands to enumerate package files. List every
+   match. Do not rely on sampling or "exploration" — the inventory must be exhaustive.
+   If re-run on the same repo state, the same components must be produced.
 
 3. EXISTING DOCS
    - Find all .md files, doc comments, docstrings, OpenAPI specs, type definitions
