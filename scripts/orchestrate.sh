@@ -906,6 +906,301 @@ EOF
 }
 
 # ============================================================
+# PHASE: history_harvest
+# ============================================================
+phase_history_harvest() {
+  local since="${1:-}"
+  local last="${2:-}"
+  local granularity="${3:-major}"
+
+  log "HISTORY_HARVEST — started"
+
+  local git_range_instruction=""
+  if [[ -n "$since" ]]; then
+    git_range_instruction="Filter commits to those after ${since}. Use: git log --since='${since}' in ${REPO_PATH}."
+  elif [[ -n "$last" ]]; then
+    git_range_instruction="Only analyse the last ${last} commits. Use: git log -n ${last} in ${REPO_PATH}."
+  else
+    git_range_instruction="Analyse the full git history of ${REPO_PATH}."
+  fi
+
+  local task="Analyse git history for ${REPO_PATH}.
+
+${git_range_instruction}
+
+Collect for each commit: hash (short), date, author, message, files changed, insertions/deletions.
+
+Auto-filter OUT:
+- Merge commits (unless they represent significant branch merges)
+- Dependency-only updates (package-lock.json, yarn.lock, requirements.txt ONLY changes)
+- Formatting/linting-only commits (detected by: only whitespace/style changes)
+- CI config tweaks (unless substantial pipeline changes)
+- .gitignore updates
+
+Write: ${SCRATCH}/history-harvest.md
+
+Format:
+## Filtered Commits
+| Date | Hash | Author | Message | Files Changed | +/- |
+|------|------|--------|---------|---------------|-----|
+
+## Excluded Commits (summary)
+- N merge commits filtered
+- N dependency-only commits filtered
+- N formatting-only commits filtered
+
+## Statistics
+- Total commits analysed: N
+- Filtered to: N meaningful commits
+- Date range: YYYY-MM-DD to YYYY-MM-DD
+- Active authors: list
+
+${HARD_RULES}"
+
+  spawn_agent "$task" "history-harvest" 600 "$(model_for economy)" > /dev/null
+
+  if [[ -f "${SCRATCH}/history-harvest.md" ]]; then
+    log "HISTORY_HARVEST — complete"
+  else
+    log "HISTORY_HARVEST — ❌ failed"
+    exit 1
+  fi
+}
+
+# ============================================================
+# PHASE: history_epochs
+# ============================================================
+phase_history_epochs() {
+  local granularity="${1:-major}"
+
+  log "HISTORY_EPOCHS — started (granularity: ${granularity})"
+
+  local granularity_instruction=""
+  if [[ "$granularity" == "major" ]]; then
+    granularity_instruction="Use AGGRESSIVE epoch detection — only significant epochs (new components, architectural shifts, major features). Fold small changes into neighbouring epochs. Aim for 5-15 epochs for a mature repo."
+  else
+    granularity_instruction="Use DETAILED epoch detection — every meaningful period of development gets an entry. Sub-divide large epochs into feature-level entries. Include minor but noteworthy changes. Aim for 2-5x more entries than a major-only view."
+  fi
+
+  local task="Read the harvest data at ${SCRATCH}/history-harvest.md.
+
+Identify natural epochs — periods of coherent development focus separated by shifts in direction.
+
+${granularity_instruction}
+
+Signals for epoch boundaries:
+- New top-level directories appearing (new component/service)
+- Large refactors (many files renamed/moved in one commit)
+- Significant dependency changes (new framework, major version bumps)
+- Gaps in commit activity (>2 weeks)
+- Shifts in which directories are being changed
+- Explicit version tags or release commits
+
+For each epoch produce:
+- Date range
+- Descriptive name (inferred from changes, not commit messages)
+- Key commits that define the epoch (hashes)
+- What was the development focus
+- Approximate magnitude (files changed, lines added/removed)
+
+Write: ${SCRATCH}/history-epochs.md
+
+Format:
+## Epoch 1: {{Descriptive Name}} (YYYY-MM-DD — YYYY-MM-DD)
+**Focus:** one-line summary
+**Key commits:** hash1, hash2, hash3
+**Magnitude:** N files changed, +N/-N lines
+**Description:** 2-3 sentences on what this epoch represents
+
+${HARD_RULES}"
+
+  spawn_agent "$task" "history-epochs" "$TIMEOUT" "$(model_for high)" > /dev/null
+
+  if [[ -f "${SCRATCH}/history-epochs.md" ]]; then
+    local epoch_count
+    epoch_count=$(grep -c '^## Epoch' "${SCRATCH}/history-epochs.md" 2>/dev/null || echo "0")
+    log "HISTORY_EPOCHS — complete (${epoch_count} epochs detected)"
+  else
+    log "HISTORY_EPOCHS — ❌ failed"
+    exit 1
+  fi
+}
+
+# ============================================================
+# PHASE: history_comprehend
+# ============================================================
+phase_history_comprehend() {
+  log "HISTORY_COMPREHEND — started"
+
+  # Extract epoch slugs from epochs file
+  local epoch_count
+  epoch_count=$(grep -c '^## Epoch' "${SCRATCH}/history-epochs.md" 2>/dev/null || echo "0")
+
+  local i=0
+  while (( i < epoch_count )); do
+    i=$((i + 1))
+    local slug="epoch-$(printf '%02d' "$i")"
+
+    # Resume support
+    if [[ -f "${SCRATCH}/history-${slug}.md" ]]; then
+      log "HISTORY_COMPREHEND/${slug} — skipped (exists)"
+      continue
+    fi
+
+    log "HISTORY_COMPREHEND/${slug} — started (${i}/${epoch_count})"
+
+    local task="Study epoch ${i} from ${SCRATCH}/history-epochs.md.
+
+Read:
+- ${SCRATCH}/history-epochs.md (find Epoch ${i})
+- ${SCRATCH}/history-harvest.md (for commit details)
+- The actual source code diffs for key commits in this epoch.
+  Use \`git show <hash> --stat\` and \`git diff <hash>~1..<hash>\` in ${REPO_PATH}
+  for the key commits listed in the epoch.
+
+Run these structured loops:
+
+LOOP 1 — INVENTORY CHANGES
+- What files were added, removed, renamed, moved?
+- What new directories/components appeared?
+- What dependencies changed?
+
+LOOP 2 — SEMANTIC CHANGES
+- What do the code changes actually DO? (read diffs, not just filenames)
+- What features were built, what bugs were fixed, what was refactored?
+- What design decisions are visible in the code?
+
+LOOP 3 — INTEGRATION IMPACT
+- Did component boundaries change?
+- Did data flows change?
+- Did deployment or infrastructure change?
+- How did this epoch change the system's shape?
+
+Write: ${SCRATCH}/history-${slug}.md
+
+Include a summary section at the end with the key narrative points for this epoch.
+
+${HARD_RULES}"
+
+    spawn_agent "$task" "history-comprehend-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
+
+    if [[ -f "${SCRATCH}/history-${slug}.md" ]]; then
+      log "HISTORY_COMPREHEND/${slug} — complete (${i}/${epoch_count})"
+    else
+      log "HISTORY_COMPREHEND/${slug} — ❌ retrying (${i}/${epoch_count})"
+      spawn_agent "$task" "history-comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)" > /dev/null
+      if [[ -f "${SCRATCH}/history-${slug}.md" ]]; then
+        log "HISTORY_COMPREHEND/${slug} — complete on retry (${i}/${epoch_count})"
+      else
+        log "HISTORY_COMPREHEND/${slug} — ❌ SKIPPED (${i}/${epoch_count})"
+      fi
+    fi
+  done
+
+  local completed
+  completed=$(find "$SCRATCH" -name "history-epoch-*.md" 2>/dev/null | wc -l | xargs)
+  log "HISTORY_COMPREHEND — complete (${completed}/${epoch_count} epochs)"
+}
+
+# ============================================================
+# PHASE: history_write
+# ============================================================
+phase_history_write() {
+  log "HISTORY_WRITE — started"
+
+  local task="Synthesise all epoch notes into a narrative changelog.
+
+Read: all history epoch scratchpads at ${SCRATCH}/history-epoch-*.md
+Also read: ${SCRATCH}/history-epochs.md for the epoch structure
+
+Write ${DOCS_DIR}/CHANGELOG.md (if it exists, PREPEND the history section before existing entries):
+
+# Project Evolution
+
+## {{Epoch Name}} ({{date range}})
+- 2-5 sentences describing what happened and why
+- Key changes as bullet points
+- Notable decisions or pivots
+
+Order: chronological (earliest first)
+Tone: factual narrative, not commit messages
+Length: proportional to significance (major epochs get more space)
+
+Do NOT include:
+- Individual commit hashes (unless truly landmark)
+- Routine maintenance or dependency updates
+- Speculation about intent — only what the code shows
+
+${HARD_RULES}"
+
+  spawn_agent "$task" "history-write" "$TIMEOUT" "$(model_for high)" > /dev/null
+
+  if [[ -f "${DOCS_DIR}/CHANGELOG.md" ]]; then
+    log "HISTORY_WRITE — complete"
+  else
+    log "HISTORY_WRITE — ❌ no CHANGELOG.md produced"
+  fi
+}
+
+# ============================================================
+# PHASE: history_review
+# ============================================================
+phase_history_review() {
+  log "HISTORY_REVIEW — started"
+
+  local max_iterations=3
+  local iteration=1
+
+  while (( iteration <= max_iterations )); do
+    log "HISTORY_REVIEW — iteration ${iteration}/${max_iterations}"
+
+    local task="Review the generated changelog for accuracy against git history.
+
+Read:
+- ${DOCS_DIR}/CHANGELOG.md
+- ${SCRATCH}/history-harvest.md (the raw commit data)
+- ${SCRATCH}/history-epochs.md (the epoch structure)
+
+Verify:
+1. DATE ACCURACY — epoch date ranges match actual commit dates
+2. ATTRIBUTION — changes attributed to the correct epoch
+3. COMPLETENESS — no significant epochs omitted (compare against git activity)
+4. NARRATIVE ACCURACY — descriptions match what the diffs actually show
+5. NO SPECULATION — changelog states facts, not inferred intent
+
+Do NOT check: file path existence, env var accuracy, function signatures.
+
+Fix any inaccuracies directly in ${DOCS_DIR}/CHANGELOG.md.
+
+Write ${SCRATCH}/history-review-${iteration}.md with:
+| Issue | Severity | Action Taken |
+
+Output on the final line: REVIEW_CLEAN or REVIEW_ISSUES: N unresolved
+
+${HARD_RULES}"
+
+    spawn_agent "$task" "history-review-${iteration}" "$TIMEOUT" "$(model_for high)" > /dev/null
+
+    if [[ -f "${SCRATCH}/history-review-${iteration}.md" ]]; then
+      if grep -q "REVIEW_CLEAN" "${SCRATCH}/history-review-${iteration}.md" 2>/dev/null; then
+        log "HISTORY_REVIEW — iteration ${iteration}: REVIEW_CLEAN"
+        break
+      else
+        local issues
+        issues=$(grep -o "REVIEW_ISSUES: [0-9]*" "${SCRATCH}/history-review-${iteration}.md" | grep -o "[0-9]*$" || echo "?")
+        log "HISTORY_REVIEW — iteration ${iteration}: ${issues} issues"
+        iteration=$((iteration + 1))
+      fi
+    else
+      log "HISTORY_REVIEW — iteration ${iteration}: ❌ no review file, retrying"
+      iteration=$((iteration + 1))
+    fi
+  done
+
+  log "HISTORY_REVIEW — complete"
+}
+
+# ============================================================
 # Main
 # ============================================================
 case "$PHASE" in
@@ -992,9 +1287,40 @@ case "$PHASE" in
 
     log "COMPLETE — deep-docs update finished"
     ;;
+  history)
+    # Parse history-specific options from remaining args (after $4/model)
+    local history_since=""
+    local history_last=""
+    local history_granularity="major"
+
+    shift 4 2>/dev/null || shift $# 2>/dev/null  # skip phase, repo, docs, model
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --since) history_since="$2"; shift 2 ;;
+        --last)  history_last="$2"; shift 2 ;;
+        --granularity) history_granularity="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+
+    log "HISTORY — started (since: ${history_since:-all}, last: ${history_last:-all}, granularity: ${history_granularity})"
+
+    mkdir -p "$SCRATCH"
+
+    phase_history_harvest "$history_since" "$history_last" "$history_granularity"
+    phase_history_epochs "$history_granularity"
+    phase_history_comprehend
+    phase_history_write
+    phase_history_review
+
+    # Note: history mode does NOT update last-run.md (read-only analysis)
+    log "COMPLETE — deep-docs history finished"
+    ;;
   *)
     echo "Unknown phase: $PHASE"
-    echo "Usage: orchestrate.sh <discover|comprehend|write|review|update|all> <repo_path> <docs_dir> [model]"
+    echo "Usage: orchestrate.sh <discover|comprehend|write|review|update|history|all> <repo_path> <docs_dir> [model]"
+    echo ""
+    echo "History options: --since YYYY-MM-DD | --last N | --granularity major|detailed"
     exit 1
     ;;
 esac
