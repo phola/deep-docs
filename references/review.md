@@ -71,7 +71,10 @@ After all fixes, write {{DOCS_DIR}}/builder/.scratch/review-{{COMPONENT_SLUG}}.m
 - Files with no issues: list as ✅ verified
 - Count: errors fixed, warnings fixed, remaining unverified items
 
-Output: COMPONENT_CLEAN or COMPONENT_ISSUES: N unresolved
+Output on the final line: COMPONENT_CLEAN or COMPONENT_ISSUES: N unresolved
+
+Note: the orchestrator reads this final line to determine per-component status and
+appends progress.md entries automatically — sub-agents do NOT need to write to progress.md.
 ```
 
 ### Aggregation Review Sub-agent
@@ -103,8 +106,10 @@ Fix any issues found in the docs (not source). Then write {{DOCS_DIR}}/REVIEW.md
 - Aggregated table from all component reviews + cross-cutting issues
 - Total counts: errors fixed, warnings fixed, remaining unverified
 
-If ALL clean: output REVIEW_CLEAN
-If issues remain: output REVIEW_ISSUES: N unresolved
+On the final line output: REVIEW_CLEAN or REVIEW_ISSUES: N unresolved
+
+Note: the orchestrator reads this final line to decide whether to re-run the review loop.
+Do NOT write to progress.md — the orchestrator handles that.
 ```
 
 ## Loop Logic

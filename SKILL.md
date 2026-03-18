@@ -30,6 +30,32 @@ comprehension loops. Documents the **as-is state** — never suggests fixes or i
 2. Read the relevant phase guide from `references/`
 3. Execute phases in order, spawning sub-agents as described
 
+## Model Routing
+
+The orchestrator uses two model tiers to balance quality and cost:
+
+| Tier | Phases | Default |
+|------|--------|---------|
+| **Quality** | comprehend, synthesise, write, review pass 2+ | `MODEL` arg (default: claude-opus-4-6) |
+| **Economy** | discover, review pass 1, diagram | `DEEP_DOCS_ECONOMY_MODEL` env var (default: claude-sonnet-4-6) |
+
+Override examples:
+```bash
+# Default — economy model for discover + review pass 1
+./scripts/orchestrate.sh all /path/to/repo /path/to/docs
+
+# Max quality — disable economy model entirely
+DEEP_DOCS_ECONOMY_MODEL="" ./scripts/orchestrate.sh all /path/to/repo /path/to/docs
+
+# Custom economy model
+DEEP_DOCS_ECONOMY_MODEL="openai/gpt-4o-mini" ./scripts/orchestrate.sh all /path/to/repo /path/to/docs
+```
+
+Rationale:
+- **Discover** is mostly mechanical file-walking + table output — economy model is sufficient
+- **Review pass 1** is a broad sweep; it just needs to flag obvious errors. Failures promoted to pass 2+ use the quality model
+- **Comprehend/write** need full reasoning — always quality model
+
 ## Phases Overview
 
 ### init mode

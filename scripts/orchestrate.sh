@@ -12,12 +12,29 @@ set -uo pipefail
 PHASE="${1:?Usage: orchestrate.sh <phase> <repo_path> <docs_dir> [model]}"
 REPO_PATH="${2:?Missing repo_path}"
 DOCS_DIR="${3:?Missing docs_dir}"
-MODEL="${4:-anthropic/claude-sonnet-4-6}"
+MODEL="${4:-anthropic/claude-opus-4-6}"
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROGRESS="${DOCS_DIR}/builder/progress.md"
 INVENTORY="${DOCS_DIR}/builder/specs/component-inventory.md"
 SCRATCH="${DOCS_DIR}/builder/.scratch"
 TIMEOUT=1800  # 30 min per sub-agent
+
+# Model routing strategy:
+# - QUALITY_MODEL  : comprehend, synthesise, write (accuracy matters most)
+# - ECONOMY_MODEL  : discover, review pass 1, diagram (mechanical/structural tasks)
+# Override ECONOMY_MODEL to "" to use QUALITY_MODEL everywhere (max quality mode).
+QUALITY_MODEL="${MODEL}"
+ECONOMY_MODEL="${DEEP_DOCS_ECONOMY_MODEL:-anthropic/claude-sonnet-4-6}"
+
+# Helper: pick model based on quality requirement
+model_for() {
+  local quality="${1:-high}"  # high | economy
+  if [[ -z "$ECONOMY_MODEL" || "$quality" == "high" ]]; then
+    echo "$QUALITY_MODEL"
+  else
+    echo "$ECONOMY_MODEL"
+  fi
+}
 
 HARD_RULES='HARD RULES:
 1. NEVER modify, fix, or suggest changes to source code
@@ -61,14 +78,22 @@ count_components() {
 }
 
 # Spawn a sub-agent and wait for completion
+# Usage: spawn_agent <task> <label> [timeout] [model]
+# Note: openclaw agent --local uses agents.defaults.model.primary from openclaw.json.
+# Per-invocation model switching is not supported by the CLI.
+# To run with Opus: set agents.defaults.model.primary to anthropic/claude-opus-4-6
+# in ~/.openclaw/openclaw.json before running the orchestrator.
+# The [model] argument is accepted for future compatibility but currently ignored.
 spawn_agent() {
   local task="$1"
   local label="$2"
   local agent_timeout="${3:-$TIMEOUT}"
+  local agent_model="${4:-$QUALITY_MODEL}"  # logged but not yet actionable
 
   local session_id="dd-${label}-$(date +%s)"
 
   openclaw agent \
+    --local \
     --session-id "$session_id" \
     --message "$task" \
     --timeout "$agent_timeout" \
@@ -131,7 +156,7 @@ On completion, append a progress line to ${PROGRESS}
 ${HARD_RULES}"
 
     local result
-    result=$(spawn_agent "$task" "comprehend-${slug}" "$TIMEOUT")
+    result=$(spawn_agent "$task" "comprehend-${slug}" "$TIMEOUT" "$(model_for high)")
 
     # Verify output
     if [[ -f "${SCRATCH}/comprehend-${slug}-summary.md" ]]; then
@@ -139,7 +164,7 @@ ${HARD_RULES}"
     else
       log "COMPREHEND/${slug} — ❌ no summary produced, retrying (${i}/${total})"
       # Retry once
-      result=$(spawn_agent "$task" "comprehend-${slug}-retry" "$TIMEOUT")
+      result=$(spawn_agent "$task" "comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)")
       if [[ -f "${SCRATCH}/comprehend-${slug}-summary.md" ]]; then
         log "COMPREHEND/${slug} — complete on retry (${i}/${total})"
       else
@@ -208,7 +233,7 @@ ${DOCS_DIR}/L4/${slug}.md
 ${HARD_RULES}"
 
     local result
-    result=$(spawn_agent "$task" "write-${slug}" "$TIMEOUT")
+    result=$(spawn_agent "$task" "write-${slug}" "$TIMEOUT" "$(model_for high)")
 
     # Verify outputs
     local written=0
@@ -222,7 +247,7 @@ ${HARD_RULES}"
       log "WRITE/${slug} — partial (${written}/3 files, ${i}/${total})"
     else
       log "WRITE/${slug} — ❌ no files produced, retrying (${i}/${total})"
-      result=$(spawn_agent "$task" "write-${slug}-retry" "$TIMEOUT")
+      result=$(spawn_agent "$task" "write-${slug}-retry" "$TIMEOUT" "$(model_for high)")
       written=0
       [[ -f "${DOCS_DIR}/L2/${slug}.md" ]] && written=$((written + 1))
       [[ -f "${DOCS_DIR}/L3/${slug}.md" ]] && written=$((written + 1))
@@ -239,13 +264,13 @@ ${HARD_RULES}"
   # Write overviews and L1
   log "WRITE/overviews — started"
 
-  spawn_agent "Write the system-level L2 overview. Read all L2 docs in ${DOCS_DIR}/L2/ and synthesis notes in ${SCRATCH}/synthesise-*.md. Write ${DOCS_DIR}/L2/overview.md covering system architecture, component relationships, end-to-end flows. Embed relevant diagrams from ${DOCS_DIR}/diagrams/. ${HARD_RULES}" "write-l2-overview" "$TIMEOUT" > /dev/null
+  spawn_agent "Write the system-level L2 overview. Read all L2 docs in ${DOCS_DIR}/L2/ and synthesis notes in ${SCRATCH}/synthesise-*.md. Write ${DOCS_DIR}/L2/overview.md covering system architecture, component relationships, end-to-end flows. Embed relevant diagrams from ${DOCS_DIR}/diagrams/. ${HARD_RULES}" "write-l2-overview" "$TIMEOUT" "$(model_for high)" > /dev/null
   log "WRITE/L2/overview.md — complete"
 
-  spawn_agent "Write the L4 system overview for AI agents. Read the first 20 lines of each L4 file in ${DOCS_DIR}/L4/ plus ${DOCS_DIR}/diagrams/dependencies.mmd. Write ${DOCS_DIR}/L4/OVERVIEW.md — NO PROSE, only headings, tables, code blocks. Include: full file inventory, dependency graph, all env vars, all CLI entry points. ${HARD_RULES}" "write-l4-overview" "$TIMEOUT" > /dev/null
+  spawn_agent "Write the L4 system overview for AI agents. Read the first 20 lines of each L4 file in ${DOCS_DIR}/L4/ plus ${DOCS_DIR}/diagrams/dependencies.mmd. Write ${DOCS_DIR}/L4/OVERVIEW.md — NO PROSE, only headings, tables, code blocks. Include: full file inventory, dependency graph, all env vars, all CLI entry points. ${HARD_RULES}" "write-l4-overview" "$TIMEOUT" "$(model_for high)" > /dev/null
   log "WRITE/L4/OVERVIEW.md — complete"
 
-  spawn_agent "Write the executive summary (LAST document). Read all L2 docs in ${DOCS_DIR}/L2/ and ${DOCS_DIR}/builder/interview-notes.md. Write ${DOCS_DIR}/L1/executive-summary.md — 1 page max, no code, no jargon. What the project does, business value, key components, current status, key risks. ${HARD_RULES}" "write-l1" "$TIMEOUT" > /dev/null
+  spawn_agent "Write the executive summary (LAST document). Read all L2 docs in ${DOCS_DIR}/L2/ and ${DOCS_DIR}/builder/interview-notes.md. Write ${DOCS_DIR}/L1/executive-summary.md — 1 page max, no code, no jargon. What the project does, business value, key components, current status, key risks. ${HARD_RULES}" "write-l1" "$TIMEOUT" "$(model_for high)" > /dev/null
   log "WRITE/L1/executive-summary.md — complete"
 
   local l2_count l3_count l4_count
@@ -288,7 +313,7 @@ IMPORTANT: Each package/workspace is its own component. Do NOT collapse multiple
 
 ${HARD_RULES}"
 
-  spawn_agent "$task" "discover" 600 > /dev/null
+  spawn_agent "$task" "discover" 600 "$(model_for economy)" > /dev/null
 
   if [[ -f "$INVENTORY" ]]; then
     local count
@@ -312,7 +337,15 @@ phase_review() {
   local max_iterations=3
 
   while (( iteration <= max_iterations )); do
-    log "REVIEW — iteration ${iteration}/${max_iterations}"
+    # Pass 1: economy model (broad sweep across all components)
+    # Pass 2+: quality model (focused on known-issues components only — worth full accuracy)
+    local review_model
+    if (( iteration == 1 )); then
+      review_model="$(model_for economy)"
+    else
+      review_model="$(model_for high)"
+    fi
+    log "REVIEW — iteration ${iteration}/${max_iterations} (model: ${review_model})"
 
     local i=0
     parse_components | while IFS='|' read -r slug name path files; do
@@ -322,6 +355,14 @@ phase_review() {
       if [[ ! -f "${DOCS_DIR}/L2/${slug}.md" && ! -f "${DOCS_DIR}/L3/${slug}.md" && ! -f "${DOCS_DIR}/L4/${slug}.md" ]]; then
         continue
       fi
+
+      # Resume support: skip if review already exists for this iteration
+      if [[ -f "${SCRATCH}/review-${slug}.md" ]]; then
+        log "REVIEW/${slug} — skipped (review exists, ${i}/${total})"
+        continue
+      fi
+
+      log "REVIEW/${slug} — started (${i}/${total})"
 
       local task="Review documentation for '${name}' against source code.
 
@@ -343,24 +384,48 @@ Output COMPONENT_CLEAN or COMPONENT_ISSUES: N unresolved
 
 ${HARD_RULES}"
 
-      spawn_agent "$task" "review-${slug}" "$TIMEOUT" > /dev/null
+      spawn_agent "$task" "review-${slug}" "$TIMEOUT" "$review_model" > /dev/null
+      if [[ -f "${SCRATCH}/review-${slug}.md" ]]; then
+        # Determine clean vs issues for progress log
+        if grep -q "COMPONENT_ISSUES" "${SCRATCH}/review-${slug}.md" 2>/dev/null; then
+          local n_issues
+          n_issues=$(grep -o "COMPONENT_ISSUES: [0-9]*" "${SCRATCH}/review-${slug}.md" | grep -o "[0-9]*$" || echo "?")
+          log "REVIEW/${slug} — complete: COMPONENT_ISSUES ${n_issues} unresolved (${i}/${total})"
+        else
+          log "REVIEW/${slug} — complete: COMPONENT_CLEAN (${i}/${total})"
+        fi
+      else
+        log "REVIEW/${slug} — ❌ no review file produced, retrying (${i}/${total})"
+        spawn_agent "$task" "review-${slug}-retry" "$TIMEOUT" "$review_model" > /dev/null
+        if [[ -f "${SCRATCH}/review-${slug}.md" ]]; then
+          log "REVIEW/${slug} — complete on retry (${i}/${total})"
+        else
+          log "REVIEW/${slug} — ❌ SKIPPED after retry (${i}/${total})"
+        fi
+      fi
     done
 
     # Aggregation
     local issues
     issues=$(grep -l "COMPONENT_ISSUES" "${SCRATCH}"/review-*.md 2>/dev/null | wc -l | xargs)
+    local clean
+    clean=$(grep -l "COMPONENT_CLEAN" "${SCRATCH}"/review-*.md 2>/dev/null | wc -l | xargs)
 
     if (( issues == 0 )); then
-      log "REVIEW — iteration ${iteration}: REVIEW_CLEAN"
+      log "REVIEW — iteration ${iteration}: REVIEW_CLEAN (${clean}/${total} components clean)"
       break
     else
-      log "REVIEW — iteration ${iteration}: ${issues} components with issues"
+      log "REVIEW — iteration ${iteration}: ${issues} components with issues, ${clean} clean"
+      # Clear review files for components with issues so they get re-reviewed
+      grep -l "COMPONENT_ISSUES" "${SCRATCH}"/review-*.md 2>/dev/null | xargs rm -f
       iteration=$((iteration + 1))
     fi
   done
 
-  # Write REVIEW.md
-  spawn_agent "Aggregate all review files from ${SCRATCH}/review-*.md into ${DOCS_DIR}/REVIEW.md. Read only files with COMPONENT_ISSUES. Write summary table. ${HARD_RULES}" "review-aggregate" "$TIMEOUT" > /dev/null
+  # Write REVIEW.md — quality model (aggregation requires cross-doc reasoning)
+  log "REVIEW/aggregate — started"
+  spawn_agent "Aggregate all review files from ${SCRATCH}/review-*.md into ${DOCS_DIR}/REVIEW.md. Read only files with COMPONENT_ISSUES. Write summary table. ${HARD_RULES}" "review-aggregate" "$TIMEOUT" "$(model_for high)" > /dev/null
+  log "REVIEW/aggregate — complete"
   log "REVIEW — complete"
 }
 
