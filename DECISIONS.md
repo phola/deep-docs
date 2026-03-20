@@ -125,3 +125,27 @@ Record of key design decisions for the deep-docs skill.
 **Decision:** Group git history into meaningful epochs (not 1:1 with commits) using signals like new directories, large refactors, activity gaps, and tag boundaries.
 
 **Rationale:** Commit-by-commit changelogs are noise. Epoch-based narrative tells the actual story of how the project evolved.
+
+## 2026-03-19: Non-deterministic slug generation (BUG)
+
+### Problem
+The discover phase generates component slugs non-deterministically. On different runs of the same repo:
+- Run 1: `dm-fun-api`, `io-fun-api`, `prog-fun-lens-notifier`, `assets-infra`
+- Run 2: `delivery-manager-fun-api`, `image-orders-fun-api`, `programming-fun-lens-notifier`, `assets-infrastructure`
+
+This breaks resume support in `all` mode because comprehend/write/review phases check for files named with the slug (e.g. `comprehend-{slug}-summary.md`). When discover re-runs and produces different slugs, all the existing summaries become invisible and the phases redo work or skip-after-retry on large components.
+
+### Impact
+- Wasted ~2.5 hours of Opus compute on a Buzz run (75 components comprehended, then discover changed slugs, causing re-comprehension attempts)
+- Required manual intervention to copy summary files with old slugs to new slug names
+
+### Root cause
+The discover sub-agent (LLM) is free to choose slug format. No deterministic slugging rule is enforced. The spec says "short kebab-case slug" but doesn't mandate a derivation algorithm.
+
+### Fix needed
+Slugs must be deterministic and derived mechanically from the component path, not LLM-generated. Options:
+1. **Orchestrator-side**: after discover, post-process the inventory and rewrite slugs using a deterministic algorithm (e.g. last 2-3 path segments, kebab-cased)
+2. **Discover prompt**: add explicit slugging rule with examples, but this is still LLM-dependent
+3. **Hybrid**: let LLM discover components, then orchestrator overwrites slug column deterministically
+
+Option 3 preferred — keeps discover flexible but slugs stable.

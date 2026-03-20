@@ -73,6 +73,52 @@ parse_components() {
   }' "$INVENTORY"
 }
 
+# Derive a deterministic slug from a component path.
+# Takes the last path segment (directory name), converts underscores to hyphens,
+# and lowercases. Same path always produces the same slug.
+# Examples:
+#   workspaces/modules/delivery_manager/delivery_manager_fun_api → delivery-manager-fun-api
+#   workspaces/libs/buzz_lib_db → buzz-lib-db
+deterministic_slug() {
+  local path="$1"
+  # Strip trailing slashes, take basename, underscore→hyphen, lowercase
+  local base
+  base=$(basename "${path%/}")
+  echo "$base" | tr '[:upper:]' '[:lower:]' | tr '_' '-'
+}
+
+# Post-process component-inventory.md to rewrite slugs deterministically.
+# Called once after discover phase. Reads the Path column, derives slug, rewrites Slug column.
+stabilise_slugs() {
+  local inv="$1"
+  [[ -f "$inv" ]] || return 1
+
+  local tmp="${inv}.tmp"
+  while IFS= read -r line; do
+    # Only process table data rows (start with "| <number>")
+    if [[ "$line" =~ ^[[:space:]]*\|[[:space:]]*[0-9] ]]; then
+      # Extract path (column 5, 1-indexed from |)
+      local path_col
+      path_col=$(echo "$line" | /usr/bin/awk -F'|' '{gsub(/`/, "", $5); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5); print $5}')
+      if [[ -n "$path_col" ]]; then
+        local new_slug
+        new_slug=$(deterministic_slug "$path_col")
+        # Replace the slug column (column 4) with the deterministic slug
+        # Preserve the rest of the line
+        line=$(echo "$line" | /usr/bin/awk -F'|' -v slug="$new_slug" '{
+          OFS="|"
+          # Rebuild: $4 is the slug column
+          $4 = " `" slug "` "
+          print
+        }')
+      fi
+    fi
+    echo "$line"
+  done < "$inv" > "$tmp"
+  mv "$tmp" "$inv"
+  log "SLUGS — stabilised (deterministic slugs from paths)"
+}
+
 count_components() {
   parse_components | wc -l | xargs
 }
@@ -155,8 +201,10 @@ ${HARD_RULES}"
     fi
 
     local mode="single-agent"
+    local num_loops=3
     if (( files_int > 30 )); then
       mode="per-loop (${files_int} files)"
+      num_loops=7
     fi
 
     log "COMPREHEND/${slug} — started (${mode}, ${i}/${total})"
@@ -164,7 +212,9 @@ ${HARD_RULES}"
     # Collect dependency summaries
     local dep_summaries="None — check component-inventory.md for dependencies and read their summaries from ${SCRATCH}/ if needed."
 
-    local task="You are studying the '${name}' component of a codebase at ${REPO_PATH}.
+    if (( num_loops <= 3 )); then
+      # ---- SMALL PROFILE: single agent, 3 loops ----
+      local task="You are studying the '${name}' component of a codebase at ${REPO_PATH}.
 Your job is to BUILD UNDERSTANDING through iterative study. Do NOT write documentation.
 
 Read these first:
@@ -175,9 +225,7 @@ Component path: ${REPO_PATH}/${path}
 Component slug: ${slug}
 
 Read the comprehension loop instructions at ${SKILL_DIR}/references/comprehend.md.
-Based on the file count (${files} source files), use the appropriate profile:
-- ≤30 files: SMALL PROFILE (3 loops)
-- >30 files: LARGE PROFILE (7 loops)
+Use the SMALL PROFILE (3 loops) for this component.
 
 Dependency context: ${dep_summaries}
 Read any relevant dependency summaries from ${SCRATCH}/comprehend-*-summary.md
@@ -189,21 +237,147 @@ On completion, append a progress line to ${PROGRESS}
 
 ${HARD_RULES}"
 
-    local result
-    result=$(spawn_agent "$task" "comprehend-${slug}" "$TIMEOUT" "$(model_for high)")
+      spawn_agent "$task" "comprehend-${slug}" "$TIMEOUT" "$(model_for high)"
 
-    # Verify output
+    else
+      # ---- LARGE PROFILE: per-loop chain, 7 sequential agents ----
+      # Each loop is a separate sub-agent to avoid context overflow on large components.
+      # Define loop names and instructions
+      local -a loop_names=("01-inventory" "02-data" "03-functions" "04-flow" "05-deps" "06-state" "07-errors")
+      local -a loop_instructions=(
+        "LOOP 1 — INVENTORY: List every file in ${REPO_PATH}/${path}: path, language, line count, rough purpose. Note entry points, config files, test files."
+        "LOOP 2 — DATA SHAPES: Schemas, types, interfaces, dataclasses, models, config structures. Input/output data formats (JSON, CSV, API payloads). Database tables, columns, relationships."
+        "LOOP 3 — FUNCTIONS: Key function/method signatures with parameters and return types. What each does (read the implementation, don't guess from name). Note side effects explicitly."
+        "LOOP 4 — INTERNAL FLOW: Call graph: what calls what, in what order. Control flow: conditionals, loops, error paths. Execution lifecycle: startup → processing → cleanup."
+        "LOOP 5 — DEPENDENCIES: External packages: what, why, version constraints. Inter-component imports: what does this component use from others? External services: APIs, databases, file systems, cloud services."
+        "LOOP 6 — STATE & SIDE EFFECTS: What does this component read? (files, DB, env vars, API responses). What does it write/mutate? (files, DB, API calls, stdout). Concurrency concerns, shared state, locking."
+        "LOOP 7 — ERROR HANDLING: What can fail? How does it fail? (exceptions, return codes, silent failures). Recovery mechanisms: retries, fallbacks, circuit breakers. Edge cases: empty inputs, missing config, network failures, race conditions."
+      )
+
+      local loop_ok=true
+      for li in $(seq 0 6); do
+        local loop_name="${loop_names[$li]}"
+        local loop_instr="${loop_instructions[$li]}"
+        local scratchpad_path="${SCRATCH}/comprehend-${slug}-${loop_name}.md"
+
+        # Skip if this loop's scratchpad already exists (resume support)
+        if [[ -f "$scratchpad_path" ]]; then
+          continue
+        fi
+
+        # Build list of prior loop scratchpads
+        local prior_pads="None — first loop."
+        if (( li > 0 )); then
+          prior_pads=""
+          for pi in $(seq 0 $((li - 1))); do
+            local prior_file="${SCRATCH}/comprehend-${slug}-${loop_names[$pi]}.md"
+            if [[ -f "$prior_file" ]]; then
+              prior_pads="${prior_pads}
+- ${prior_file}"
+            fi
+          done
+          [[ -z "$prior_pads" ]] && prior_pads="None — prior loops not found."
+        fi
+
+        local loop_task="You are studying the '${name}' component of a codebase at ${REPO_PATH}.
+This is loop $((li + 1)) of 7 for a large component (${files} source files).
+
+Read:
+- ${DOCS_DIR}/builder/specs/component-inventory.md (your component's entry)
+- Previous loop outputs for THIS component: ${prior_pads}
+- Dependency summaries from ${SCRATCH}/comprehend-*-summary.md (if relevant)
+- Source code at ${REPO_PATH}/${path}
+
+Run ONLY this loop:
+${loop_instr}
+
+Write scratchpad to: ${scratchpad_path}
+
+${HARD_RULES}"
+
+        spawn_agent "$loop_task" "comprehend-${slug}-loop-$((li + 1))" "$TIMEOUT" "$(model_for high)"
+
+        if [[ ! -f "$scratchpad_path" ]]; then
+          log "COMPREHEND/${slug} — ⚠️ loop $((li + 1)) (${loop_name}) failed, retrying"
+          spawn_agent "$loop_task" "comprehend-${slug}-loop-$((li + 1))-retry" "$TIMEOUT" "$(model_for high)"
+          if [[ ! -f "$scratchpad_path" ]]; then
+            log "COMPREHEND/${slug} — ❌ loop $((li + 1)) (${loop_name}) failed after retry"
+            loop_ok=false
+            break
+          fi
+        fi
+      done
+
+      # Final summary agent — reads all loop outputs and writes the summary
+      if [[ "$loop_ok" == true ]]; then
+        local all_pads=""
+        for li in $(seq 0 6); do
+          all_pads="${all_pads}
+- ${SCRATCH}/comprehend-${slug}-${loop_names[$li]}.md"
+        done
+
+        local summary_task="You are writing the comprehension summary for '${name}' (${files} source files).
+
+Read ALL loop scratchpads: ${all_pads}
+
+Also read:
+- ${DOCS_DIR}/builder/specs/component-inventory.md (your component's entry)
+- Dependency summaries from ${SCRATCH}/comprehend-*-summary.md (if relevant)
+
+Write a comprehensive summary to:
+${SCRATCH}/comprehend-${slug}-summary.md
+
+Include:
+- Key insights and surprises
+- Architecture overview (entry points, main flows, data model)
+- Relationships to other components discovered
+- Open questions or things that remain unclear (mark <!-- UNVERIFIED -->)
+
+${HARD_RULES}"
+
+        spawn_agent "$summary_task" "comprehend-${slug}-summary" "$TIMEOUT" "$(model_for high)"
+      fi
+    fi
+
+    # Verify output (works for both small and large profiles)
     if [[ -f "${SCRATCH}/comprehend-${slug}-summary.md" ]]; then
       log "COMPREHEND/${slug} — complete (${i}/${total})"
     else
-      log "COMPREHEND/${slug} — ❌ no summary produced, retrying (${i}/${total})"
-      # Retry once
-      result=$(spawn_agent "$task" "comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)")
-      if [[ -f "${SCRATCH}/comprehend-${slug}-summary.md" ]]; then
-        log "COMPREHEND/${slug} — complete on retry (${i}/${total})"
+      if (( num_loops <= 3 )); then
+        # Only retry single-agent mode (per-loop already has per-loop retries above)
+        log "COMPREHEND/${slug} — ❌ no summary produced, retrying (${i}/${total})"
+        local task="You are studying the '${name}' component of a codebase at ${REPO_PATH}.
+Your job is to BUILD UNDERSTANDING through iterative study. Do NOT write documentation.
+
+Read these first:
+- ${DOCS_DIR}/builder/interview-notes.md (user context)
+- ${DOCS_DIR}/builder/specs/component-inventory.md (find your component's entry)
+
+Component path: ${REPO_PATH}/${path}
+Component slug: ${slug}
+
+Read the comprehension loop instructions at ${SKILL_DIR}/references/comprehend.md.
+Use the SMALL PROFILE (3 loops) for this component.
+
+Dependency context: ${dep_summaries}
+Read any relevant dependency summaries from ${SCRATCH}/comprehend-*-summary.md
+
+After ALL loops, write a summary scratchpad to:
+${SCRATCH}/comprehend-${slug}-summary.md
+
+On completion, append a progress line to ${PROGRESS}
+
+${HARD_RULES}"
+        spawn_agent "$task" "comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)"
+        if [[ -f "${SCRATCH}/comprehend-${slug}-summary.md" ]]; then
+          log "COMPREHEND/${slug} — complete on retry (${i}/${total})"
+        else
+          log "COMPREHEND/${slug} — ❌ SKIPPED after retry (${i}/${total})"
+          echo "- ${name} (${slug}): no summary produced after 2 attempts" >> "${DOCS_DIR}/builder/skipped-components.md"
+        fi
       else
-        log "COMPREHEND/${slug} — ❌ SKIPPED after retry (${i}/${total})"
-        echo "- ${name} (${slug}): no summary produced after 2 attempts" >> "${DOCS_DIR}/builder/skipped-components.md"
+        log "COMPREHEND/${slug} — ❌ SKIPPED (per-loop chain failed, ${i}/${total})"
+        echo "- ${name} (${slug}): per-loop chain failed" >> "${DOCS_DIR}/builder/skipped-components.md"
       fi
     fi
   done
@@ -356,9 +530,11 @@ ${HARD_RULES}"
   spawn_agent "$task" "discover" 600 "$(model_for economy)" > /dev/null
 
   if [[ -f "$INVENTORY" ]]; then
+    # Rewrite slugs deterministically from paths (LLM-generated slugs are non-deterministic)
+    stabilise_slugs "$INVENTORY"
     local count
     count=$(count_components)
-    log "DISCOVER — complete (${count} components)"
+    log "DISCOVER — complete (${count} components, slugs stabilised)"
   else
     log "DISCOVER — ❌ failed"
     exit 1
