@@ -388,6 +388,117 @@ ${HARD_RULES}"
 }
 
 # ============================================================
+# PHASE: write_groups
+# ============================================================
+
+# Parse component-groups.md table rows
+# Expected format: | # | Group | Slug | Path Prefix | Components | Purpose |
+parse_groups() {
+  local groups_file="${DOCS_DIR}/builder/specs/component-groups.md"
+  [[ -f "$groups_file" ]] || return
+  /usr/bin/awk -F'|' '/^\| [0-9]/ {
+    gsub(/`/, "", $4); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4);  # slug
+    gsub(/`/, "", $3); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);  # name
+    gsub(/`/, "", $5); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5);  # path prefix
+    gsub(/`/, "", $6); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6);  # components
+    if ($4 != "" && $4 != "Slug") print $4 "|" $3 "|" $5 "|" $6
+  }' "$groups_file"
+}
+
+count_groups() {
+  parse_groups | wc -l | xargs
+}
+
+phase_write_groups() {
+  local groups_file="${DOCS_DIR}/builder/specs/component-groups.md"
+  if [[ ! -f "$groups_file" ]]; then
+    log "WRITE_GROUPS — skipped (no component-groups.md)"
+    return
+  fi
+
+  local total
+  total=$(count_groups)
+  if (( total < 2 )); then
+    log "WRITE_GROUPS — skipped (fewer than 2 groups)"
+    return
+  fi
+
+  mkdir -p "${DOCS_DIR}/L2/groups"
+  log "WRITE_GROUPS — started (${total} groups)"
+
+  local i=0
+  parse_groups | while IFS='|' read -r slug name path_prefix components; do
+    i=$((i + 1))
+
+    # Resume support
+    if [[ -f "${DOCS_DIR}/L2/groups/${slug}.md" ]]; then
+      log "WRITE_GROUPS/${slug} — skipped (exists, ${i}/${total})"
+      continue
+    fi
+
+    log "WRITE_GROUPS/${slug} — started (${i}/${total})"
+
+    # Build list of member L2/L3 files from the components field
+    local member_l2_files=""
+    local member_l3_files=""
+    IFS=',' read -ra member_slugs <<< "$components"
+    for msraw in "${member_slugs[@]}"; do
+      local ms
+      ms=$(echo "$msraw" | xargs)  # trim whitespace
+      [[ -z "$ms" ]] && continue
+      [[ -f "${DOCS_DIR}/L2/${ms}.md" ]] && member_l2_files="${member_l2_files}
+- ${DOCS_DIR}/L2/${ms}.md"
+      [[ -f "${DOCS_DIR}/L3/${ms}.md" ]] && member_l3_files="${member_l3_files}
+- ${DOCS_DIR}/L3/${ms}.md"
+    done
+
+    local task="Write a module/subsystem overview for the '${name}' group.
+
+Read these inputs:
+- ${groups_file} (find your group's entry and member list)
+- L2 docs for member components: ${member_l2_files}
+- L3 docs for member components (for architecture context): ${member_l3_files}
+- Synthesis notes: ${SCRATCH}/synthesise-*.md (for cross-component flows)
+- Diagrams: ${DOCS_DIR}/diagrams/ (embed relevant ones)
+
+Write ONE file: ${DOCS_DIR}/L2/groups/${slug}.md
+
+Structure:
+1. Overview — What this module/subsystem does as a unit (2-3 paragraphs)
+2. Component Map — Table: Package | Type | Purpose (categorise by: API, UI, Database, Integration, Infrastructure, Contracts/Models, Search, etc.)
+3. Internal Architecture — Mermaid diagram showing how packages within the group relate. Show data flow direction.
+4. Data Model — Key entities/schemas owned by this group. Simple ER diagram if >3 entity types.
+5. Integration Points — Events published, events consumed, contracts exposed, cross-module dependencies.
+6. Key Business Rules — Important domain logic in plain language.
+7. Operational Notes — Deployment units, infra dependencies, monitoring.
+
+Audience: architects, tech leads, BAs, new team members.
+Length: 3-6 pages. Use mermaid diagrams liberally.
+
+${HARD_RULES}"
+
+    spawn_agent "$task" "write-group-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
+
+    if [[ -f "${DOCS_DIR}/L2/groups/${slug}.md" ]]; then
+      log "WRITE_GROUPS/${slug} — complete (${i}/${total})"
+    else
+      log "WRITE_GROUPS/${slug} — ❌ retrying (${i}/${total})"
+      spawn_agent "$task" "write-group-${slug}-retry" "$TIMEOUT" "$(model_for high)" > /dev/null
+      if [[ -f "${DOCS_DIR}/L2/groups/${slug}.md" ]]; then
+        log "WRITE_GROUPS/${slug} — complete on retry (${i}/${total})"
+      else
+        log "WRITE_GROUPS/${slug} — ❌ SKIPPED (${i}/${total})"
+        echo "- Group: ${name} (${slug}): no group doc produced" >> "${DOCS_DIR}/builder/skipped-components.md"
+      fi
+    fi
+  done
+
+  local group_count
+  group_count=$(find "${DOCS_DIR}/L2/groups" -name "*.md" 2>/dev/null | wc -l | xargs)
+  log "WRITE_GROUPS — complete (${group_count}/${total} group docs)"
+}
+
+# ============================================================
 # PHASE: write
 # ============================================================
 phase_write() {
@@ -468,6 +579,9 @@ ${HARD_RULES}"
       fi
     fi
   done
+
+  # Write group overviews (after all per-component docs)
+  phase_write_groups
 
   # Write overviews and L1
   log "WRITE/overviews — started"
@@ -660,24 +774,59 @@ phase_diff_discovery() {
     log "DIFF_DISCOVERY — no last-run.md found, comparing docs vs current source directly"
   fi
 
-  local git_context=""
+  # Pre-compute git diff to avoid agent needing to explore
+  local git_diff_file="${SCRATCH}/git-diff-raw.md"
+  mkdir -p "$SCRATCH"
   if [[ -n "$last_run_date" ]]; then
-    git_context="Run \`git log --oneline --since='${last_run_date}' -- .\` in ${REPO_PATH} to see what changed since last docs run.
-Also run \`git diff --name-status \$(git log --since='${last_run_date}' --format=%H -- . | tail -1)..HEAD -- .\` for a file-level diff."
+    local base_commit
+    base_commit=$(cd "$REPO_PATH" && git log --since="$last_run_date" --format=%H -- . | tail -1)
+    if [[ -n "$base_commit" ]]; then
+      {
+        echo "# Git Changes Since ${last_run_date}"
+        echo ""
+        echo "## Commits"
+        (cd "$REPO_PATH" && git log --oneline "${base_commit}..HEAD" -- .)
+        echo ""
+        echo "## Files Changed (name-status)"
+        (cd "$REPO_PATH" && git diff --name-status "${base_commit}..HEAD" -- .)
+        echo ""
+        echo "## Diffstat"
+        (cd "$REPO_PATH" && git diff --stat "${base_commit}..HEAD" -- .)
+      } > "$git_diff_file"
+    else
+      {
+        echo "# Git Changes (no commits found since ${last_run_date})"
+        echo ""
+        echo "## Recent Commits"
+        (cd "$REPO_PATH" && git log --oneline -20 -- .)
+        echo ""
+        echo "## Files Changed (last 20 commits)"
+        (cd "$REPO_PATH" && git diff --name-status HEAD~20..HEAD -- . 2>/dev/null || echo "Unable to diff")
+      } > "$git_diff_file"
+    fi
+    log "DIFF_DISCOVERY — git diff pre-computed to ${git_diff_file}"
   else
-    git_context="No previous run date available. Compare existing L4 docs against current source code to detect drift."
+    echo "# No last-run date — full comparison needed" > "$git_diff_file"
   fi
 
   local task="You are running DIFF DISCOVERY for a documentation update.
 
-Compare the current source code against existing documentation.
+Map git changes to documented components. Do NOT read L4 docs — use the
+component inventory to map file paths to component slugs.
 
-Read:
-- ${INVENTORY} (what was documented)
-- All L4 docs in ${DOCS_DIR}/L4/ (most precise inventory of what was documented)
-- ${last_run_file} (if it exists — contains date of last run)
+Read ONLY these files:
+- ${INVENTORY} (component list with paths — use this to map changed files to components)
+- ${last_run_file} (last run metadata)
+- ${git_diff_file} (pre-computed git diff — already generated, just read it)
 
-${git_context}
+For MODIFIED components, you may read the specific changed source files listed in
+the git diff to understand WHAT changed (not just that it changed). But do NOT read
+L4 docs or any other documentation files.
+
+Mapping rules:
+- A changed file at path X belongs to the component whose Path column in the
+  inventory is a prefix of X
+- If a changed file doesn't match any component path, note it as unmapped
 
 Produce ${SCRATCH}/update-diff.md with this structure:
 
@@ -698,23 +847,23 @@ Produce ${SCRATCH}/update-diff.md with this structure:
 
 ## Detail
 For each MODIFIED component, describe specifically what changed:
-- Which functions/schemas/behaviours differ
 - Which source files were added/removed/modified
+- Brief description of the nature of changes (read the actual changed files)
 
-For each change, classify as:
-- NEW: files/components that exist in source but not in docs
-- MODIFIED: source files whose behaviour no longer matches L4 description
-- REMOVED: documented items that no longer exist in source
-- STRUCTURAL: renames, moves, reorganisation
-- UNCHANGED: components where docs still match source
+Classifications:
+- NEW: component directories that exist in source but not in the inventory
+- MODIFIED: source files changed since last run within a documented component
+- REMOVED: documented components whose directories no longer exist
+- STRUCTURAL: renames, moves, reorganisation of component boundaries
+- UNCHANGED: no git changes in the component's directory
 
 List affected components in dependency order.
 
-If NO changes detected (all components UNCHANGED): output NO_CHANGES_DETECTED as the final line.
+If NO changes detected: output NO_CHANGES_DETECTED as the final line.
 
 ${HARD_RULES}"
 
-  spawn_agent "$task" "diff-discovery" 600 "$(model_for economy)" > /dev/null
+  spawn_agent "$task" "diff-discovery" "$TIMEOUT" "$(model_for high)" > /dev/null
 
   if [[ -f "${SCRATCH}/update-diff.md" ]]; then
     if grep -q "NO_CHANGES_DETECTED" "${SCRATCH}/update-diff.md" 2>/dev/null; then
@@ -735,8 +884,8 @@ ${HARD_RULES}"
 # Returns pipe-delimited lines: slug|classification
 parse_affected_components() {
   /usr/bin/awk -F'|' '/^\| .+ \| (NEW|MODIFIED|REMOVED|STRUCTURAL)/ {
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);  # slug
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);  # classification
+    gsub(/`/, "", $2); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);  # slug (strip backticks)
+    gsub(/`/, "", $3); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);  # classification
     if ($2 != "" && $2 != "Slug") print $2 "|" $3
   }' "${SCRATCH}/update-diff.md"
 }
@@ -896,7 +1045,7 @@ phase_update_docs() {
   local updated=0
   local has_system_changes=false
 
-  parse_components | while IFS='|' read -r slug name path files; do
+  while IFS='|' read -r slug name path files; do
     i=$((i + 1))
 
     local classification
@@ -995,7 +1144,10 @@ ${HARD_RULES}"
         ;;
     esac
     updated=$((updated + 1))
-  done
+  done < <(parse_components)
+
+  # Regenerate group docs if groups exist and components changed
+  phase_write_groups
 
   # Regenerate overviews and L1 if there were system-level changes
   if [[ "$has_system_changes" == "true" ]] || (( updated > 0 )); then
@@ -1377,6 +1529,130 @@ ${HARD_RULES}"
 }
 
 # ============================================================
+# PHASE: package (generate MkDocs Material site)
+# ============================================================
+phase_package() {
+  log "PACKAGE — started"
+
+  # Build the project name from interview notes or fallback
+  local project_name="Documentation"
+  if [[ -f "${DOCS_DIR}/builder/interview-notes.md" ]]; then
+    local detected
+    detected=$(grep -i -m1 'project\|name\|title' "${DOCS_DIR}/builder/interview-notes.md" | head -1 | sed 's/.*: *//' | xargs)
+    [[ -n "$detected" ]] && project_name="$detected"
+  fi
+
+  # Collect file listings for the sub-agent
+  local l1_files l2_files l2_group_files l3_files l4_files diagram_files extra_files
+  l1_files=$(find "${DOCS_DIR}/L1" -name "*.md" 2>/dev/null | sort | sed "s|${DOCS_DIR}/||")
+  l2_files=$(find "${DOCS_DIR}/L2" -maxdepth 1 -name "*.md" 2>/dev/null | sort | sed "s|${DOCS_DIR}/||")
+  l2_group_files=$(find "${DOCS_DIR}/L2/groups" -name "*.md" 2>/dev/null | sort | sed "s|${DOCS_DIR}/||")
+  l3_files=$(find "${DOCS_DIR}/L3" -name "*.md" 2>/dev/null | sort | sed "s|${DOCS_DIR}/||")
+  l4_files=$(find "${DOCS_DIR}/L4" -name "*.md" 2>/dev/null | sort | sed "s|${DOCS_DIR}/||")
+  diagram_files=$(find "${DOCS_DIR}/diagrams" -name "*.md" 2>/dev/null | sort | sed "s|${DOCS_DIR}/||")
+  extra_files=""
+  [[ -f "${DOCS_DIR}/CHANGELOG.md" ]] && extra_files="${extra_files}
+CHANGELOG.md"
+  [[ -f "${DOCS_DIR}/REVIEW.md" ]] && extra_files="${extra_files}
+REVIEW.md"
+
+  local task="Generate a MkDocs Material documentation site configuration.
+
+Project name: ${project_name}
+Docs directory: ${DOCS_DIR}
+
+Available files:
+
+L1 files:
+${l1_files}
+
+L2 files (per-component):
+${l2_files}
+
+L2 group files:
+${l2_group_files}
+
+L3 files:
+${l3_files}
+
+L4 files:
+${l4_files}
+
+Diagram files:
+${diagram_files}
+
+Extra files:
+${extra_files}
+
+Read:
+- ${DOCS_DIR}/builder/specs/component-inventory.md (for component names and grouping)
+- ${DOCS_DIR}/builder/specs/component-groups.md (if it exists — for module grouping in nav)
+
+Generate TWO files:
+
+1. ${DOCS_DIR}/mkdocs.yml — Full MkDocs Material configuration with:
+   - Material theme with navigation.tabs, navigation.sections, search, dark mode toggle
+   - Mermaid diagram support via pymdownx.superfences
+   - Admonitions, tables, tabbed content, TOC with permalinks
+   - Complete nav structure listing EVERY documentation file:
+     - Home (index.md)
+     - Executive Summary (L1)
+     - System Overview section with:
+       - Overview (L2/overview.md)
+       - Modules subsection (one entry per group from L2/groups/)
+       - Components subsection (L2 per-component files, grouped by module if groups exist)
+     - Developer Reference section (all L3 files, grouped by module if groups exist)
+     - AI Agent Reference section (L4/OVERVIEW.md + all L4 component files)
+     - Diagrams (diagrams/INDEX.md)
+     - Changelog and Review if they exist
+   IMPORTANT: List EVERY file. Do not sample or abbreviate. Count your entries against the file lists above.
+
+2. ${DOCS_DIR}/index.md — Landing page with:
+   - Project title and description
+   - Table of documentation tiers with links
+   - Module overview table (if groups exist) with links to group docs
+   - Quick links to diagrams, changelog, review
+
+Use relative paths throughout. All files stay in their current locations —
+MkDocs serves directly from ${DOCS_DIR}/.
+
+${HARD_RULES}"
+
+  spawn_agent "$task" "package" "$TIMEOUT" "$(model_for economy)" > /dev/null
+
+  if [[ -f "${DOCS_DIR}/mkdocs.yml" ]]; then
+    log "PACKAGE — mkdocs.yml generated"
+  else
+    log "PACKAGE — ❌ mkdocs.yml not generated"
+    return 1
+  fi
+
+  if [[ -f "${DOCS_DIR}/index.md" ]]; then
+    log "PACKAGE — index.md generated"
+  else
+    log "PACKAGE — ⚠️ index.md not generated (mkdocs.yml may still work)"
+  fi
+
+  # Try to build if mkdocs is available
+  if command -v mkdocs &>/dev/null; then
+    log "PACKAGE — building site..."
+    local build_output
+    build_output=$(cd "${DOCS_DIR}" && mkdocs build --strict 2>&1) || true
+    if [[ -d "${DOCS_DIR}/site" ]]; then
+      local page_count
+      page_count=$(find "${DOCS_DIR}/site" -name "*.html" | wc -l | xargs)
+      log "PACKAGE — site built (${page_count} pages in ${DOCS_DIR}/site/)"
+    else
+      log "PACKAGE — ⚠️ mkdocs build did not produce site/. Output: ${build_output}"
+    fi
+  else
+    log "PACKAGE — mkdocs not installed. To build: pip install mkdocs-material && cd ${DOCS_DIR} && mkdocs build"
+  fi
+
+  log "PACKAGE — complete"
+}
+
+# ============================================================
 # Main
 # ============================================================
 case "$PHASE" in
@@ -1414,6 +1690,7 @@ case "$PHASE" in
     phase_write
     phase_review
     phase_record "init"
+    phase_package
 
     log "COMPLETE — deep-docs init finished"
     ;;
@@ -1492,9 +1769,15 @@ case "$PHASE" in
     # Note: history mode does NOT update last-run.md (read-only analysis)
     log "COMPLETE — deep-docs history finished"
     ;;
+  groups)
+    phase_write_groups
+    ;;
+  package)
+    phase_package
+    ;;
   *)
     echo "Unknown phase: $PHASE"
-    echo "Usage: orchestrate.sh <discover|comprehend|write|review|update|history|all> <repo_path> <docs_dir> [model]"
+    echo "Usage: orchestrate.sh <discover|comprehend|write|groups|review|package|update|history|all> <repo_path> <docs_dir> [model]"
     echo ""
     echo "History options: --since YYYY-MM-DD | --last N | --granularity major|detailed"
     exit 1

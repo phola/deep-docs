@@ -41,6 +41,30 @@ Explore the repository at {{REPO_PATH}} thoroughly:
    match. Do not rely on sampling or "exploration" — the inventory must be exhaustive.
    If re-run on the same repo state, the same components must be produced.
 
+2b. COMPONENT GROUPING
+   After detecting individual components, identify logical groups:
+
+   a) **Path-based** (preferred): Components sharing a common parent directory form a group.
+      Example: all packages under `workspaces/modules/content_library/` → "Content Library" group.
+   
+   b) **Naming convention**: Components sharing a consistent prefix form a group.
+      Example: `cl_fun_api`, `cl_lib_db`, `cl_lib_models` → "Content Library" group.
+   
+   c) **Shared infrastructure**: Components that share infrastructure stacks
+      (same Cosmos DB, same Service Bus topics) form a group.
+   
+   d) **Singleton groups**: If a group would contain only 1 component, do NOT create
+      a group for it — the component stands alone.
+   
+   e) **Platform/shared groups**: Cross-cutting libraries and infrastructure that serve
+      all modules may form a "Platform" or "Shared" group if there are ≥3 such components.
+
+   For each group note: group name, group slug (hyphenated lowercase), member component
+   slugs, shared path prefix (if any), brief purpose statement.
+
+   DETERMINISM RULE: Groups must be derived from structural signals (paths, prefixes),
+   not subjective judgement. Same repo state = same groups on every run.
+
 3. EXISTING DOCS
    - Find all .md files, doc comments, docstrings, OpenAPI specs, type definitions
    - Assess quality: stub vs. substantive, current vs. stale
@@ -71,6 +95,19 @@ OUTPUT two files:
 
 - Mark any components that are unclear or need deeper investigation
 
+{{DOCS_DIR}}/builder/specs/component-groups.md
+- Groups in dependency order
+- Use this table format:
+
+| # | Group | Slug | Path Prefix | Components | Purpose |
+|---|-------|------|-------------|------------|---------|
+| 1 | Content Library | content-library | workspaces/modules/content_library/ | cl-fun-api, cl-lib-db, cl-lib-models, ... | Media catalogue and metadata management |
+| 2 | Shared Platform | shared-platform | workspaces/common/ | buzz-lib-db, buzz-lib-events, ... | Cross-cutting libraries used by all modules |
+
+- If no meaningful groups detected (e.g., flat repo with <5 components), write
+  the file with an empty table and a note: "No component groups detected — all
+  components are standalone."
+
 Do NOT write any documentation. Discovery only.
 ```
 
@@ -78,6 +115,7 @@ Do NOT write any documentation. Discovery only.
 
 After the sub-agent completes, present the generated specs to the user:
 - Show the component inventory as a summary
+- Show the component groups (if any)
 - Ask: "Does this look right? Anything to add, remove, or reorganise?"
 - Apply any corrections before proceeding
 

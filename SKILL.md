@@ -68,8 +68,9 @@ Rationale:
 | 4 | Comprehend | [comprehend.md](references/comprehend.md) | Per component | None |
 | 5 | Synthesise | [synthesise.md](references/synthesise.md) | 1 | None |
 | 6 | Diagram | [diagram.md](references/diagram.md) | 1 | None |
-| 7 | Write | [write.md](references/write.md) | Per component + L2/L4 overviews + L1 | None |
+| 7 | Write | [write.md](references/write.md) | Per component + per group + L2/L4 overviews + L1 | None |
 | 8 | Review | [review.md](references/review.md) | 1 (loops until clean) | ✅ Final approval |
+| 9 | Package | [package.md](references/package.md) | 1 | ✅ Deployment choice |
 
 ### update mode
 
@@ -85,6 +86,7 @@ See [audience-tiers.md](references/audience-tiers.md) for full definitions.
 
 - **L1** — Executive summary. Leadership, stakeholders. 1 page, no code.
 - **L2** — Product/BA level. Data flows, diagrams, business rules. 2-4 pages per component.
+- **L2-Group** — Module/subsystem overview. Architects, tech leads. Groups related packages into logical units with internal architecture, integration points, and business rules. 3-6 pages per group.
 - **L3** — Developer level. Architecture, patterns, gotchas, code references. Detailed.
 - **L4** — Model context. Structured inventory for AI agents. No prose — headings, tables, code blocks.
 

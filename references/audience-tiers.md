@@ -18,6 +18,19 @@ All tiers live in `{{DOCS_DIR}}/` within the target repo.
 - **Length:** 2-4 pages per component
 - **Tone:** Semi-technical — explains "what" and "why" without implementation details
 
+## L2-Group — Module/Subsystem Overview
+- **Audience:** Architects, tech leads, BAs, new team members
+- **Format:** `{{DOCS_DIR}}/L2/groups/` directory, one file per component group
+- **Content:** What the group does as a unit, which packages compose it, internal package
+  relationships (Mermaid diagram), data flow within the group, how the group interfaces
+  with other groups, key domain concepts, the group's role in the overall system
+- **Length:** 3-6 pages per group
+- **Tone:** Semi-technical — bridges the L1 system summary and L2 per-package detail.
+  Answers "what is the Content Library?" before the reader dives into cl_fun_api, cl_lib_db, etc.
+- **Generated:** After all per-component L2/L3/L4 docs, before L2 overview and L1.
+  Requires component-groups.md from discover phase.
+- **Skip condition:** If fewer than 2 groups detected, skip this tier entirely.
+
 ## L3 — Developer
 - **Audience:** Engineers, handover recipients, future maintainers
 - **Format:** `{{DOCS_DIR}}/L3/` directory, one file per component

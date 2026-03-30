@@ -80,19 +80,95 @@ Write THREE files:
 {{HARD_RULES}}
 ```
 
+## L2-Group Sub-agent Task (after all per-component writes)
+
+If `{{DOCS_DIR}}/builder/specs/component-groups.md` exists and contains groups,
+spawn one sub-agent per group. Skip if no groups or fewer than 2 groups.
+
+CRITICAL: The orchestrator MUST loop through EVERY group in component-groups.md
+and spawn a write sub-agent for each one individually.
+
+Orchestrator group-write loop:
+```
+For each group in component-groups.md:
+  1. Spawn group-write sub-agent
+  2. Verify L2/groups/{{GROUP_SLUG}}.md exists
+  3. Log completion to progress.md
+  4. If failed after retry, log to skipped-components.md
+  5. Next group
+
+After ALL groups: spawn overview + L1 sub-agents (which now reference groups).
+```
+
+Per-group sub-agent task:
+
+```
+Write a module/subsystem overview for the "{{GROUP_NAME}}" group.
+
+Read these inputs:
+- {{DOCS_DIR}}/builder/specs/component-groups.md (find your group's entry and member list)
+- L2 docs for each member component: {{DOCS_DIR}}/L2/{{MEMBER_SLUG}}.md (for each member)
+- L3 docs for each member component: {{DOCS_DIR}}/L3/{{MEMBER_SLUG}}.md (for architecture context)
+- Synthesis notes: {{DOCS_DIR}}/builder/.scratch/synthesise-*.md (for cross-component flows)
+- Diagrams: {{DOCS_DIR}}/diagrams/ (embed relevant ones)
+
+Write ONE file:
+
+{{DOCS_DIR}}/L2/groups/{{GROUP_SLUG}}.md
+
+Structure:
+1. **Overview** — What this module/subsystem does as a unit (2-3 paragraphs).
+   This is the "what is the Content Library?" answer.
+
+2. **Component Map** — Table listing every package in the group:
+   | Package | Type | Purpose |
+   Categorise packages by role: API, UI, Database, Integration, Infrastructure,
+   Contracts/Models, Search, etc.
+   IMPORTANT: Link each package name to its detailed L2 doc using relative paths:
+   `[cl_fun_api](../cl-fun-api.md)` — the group docs live in L2/groups/ so
+   component docs are one level up (../).
+
+3. **Internal Architecture** — Mermaid diagram showing how packages within the
+   group relate to each other. Show data flow direction.
+
+4. **Data Model** — Key entities/schemas owned by this group. What data does it
+   manage? Include a simple ER-style diagram if the group owns >3 entity types.
+
+5. **Integration Points** — How this group connects to other groups/modules:
+   - Events published (Service Bus topics, etc.)
+   - Events consumed
+   - Contracts exposed to other modules
+   - Shared data or cross-module queries
+
+6. **Key Business Rules** — The important domain logic this group implements,
+   in plain language. Pull from L2 component docs but elevate to group level.
+
+7. **Operational Notes** — Deployment units, infrastructure dependencies,
+   monitoring/health considerations for the group as a whole.
+
+Audience: architects, tech leads, BAs, new team members who need to understand
+what this module IS before diving into individual package docs.
+
+Length: 3-6 pages. Use mermaid diagrams liberally.
+
+{{HARD_RULES}}
+```
+
 ## L2 Overview Sub-agent
 
-After all components, spawn one sub-agent for the system overview:
+After all components AND all groups, spawn one sub-agent for the system overview:
 
 ```
 Write the system-level L2 overview.
 
-Read: all synthesis scratchpads, all L2 component docs, diagrams/INDEX.md
+Read: all synthesis scratchpads, all L2 group docs ({{DOCS_DIR}}/L2/groups/*.md),
+all L2 component docs, diagrams/INDEX.md
 
 Write {{DOCS_DIR}}/L2/overview.md:
 - System-level data flow (embed architecture diagram)
-- How components relate (embed dependency graph)
-- End-to-end flows in plain language
+- Module/group map: list each group with one-sentence purpose (link to group doc)
+- How groups relate to each other (embed dependency graph at group level)
+- End-to-end flows in plain language (referencing groups, not individual packages)
 - Scheduling and orchestration overview
 ```
 
