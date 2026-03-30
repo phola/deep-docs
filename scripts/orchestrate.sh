@@ -143,7 +143,7 @@ spawn_agent() {
     --session-id "$session_id" \
     --message "$task" \
     --timeout "$agent_timeout" \
-    > /dev/null 2>&1 || true
+    < /dev/null > /dev/null 2>&1 || true
 }
 
 # ============================================================
@@ -155,7 +155,7 @@ phase_comprehend() {
   log "COMPREHEND — started (${total} components)"
 
   local i=0
-  parse_components | while IFS='|' read -r slug name path files; do
+  while IFS='|' read -r slug name path files; do
     i=$((i + 1))
     
     # Check if summary already exists (resume support)
@@ -380,7 +380,7 @@ ${HARD_RULES}"
         echo "- ${name} (${slug}): per-loop chain failed" >> "${DOCS_DIR}/builder/skipped-components.md"
       fi
     fi
-  done
+  done < <(parse_components)
 
   local summaries
   summaries=$(find "$SCRATCH" -name "comprehend-*-summary.md" | wc -l | xargs)
@@ -427,7 +427,7 @@ phase_write_groups() {
   log "WRITE_GROUPS — started (${total} groups)"
 
   local i=0
-  parse_groups | while IFS='|' read -r slug name path_prefix components; do
+  while IFS='|' read -r slug name path_prefix components; do
     i=$((i + 1))
 
     # Resume support
@@ -491,7 +491,7 @@ ${HARD_RULES}"
         echo "- Group: ${name} (${slug}): no group doc produced" >> "${DOCS_DIR}/builder/skipped-components.md"
       fi
     fi
-  done
+  done < <(parse_groups)
 
   local group_count
   group_count=$(find "${DOCS_DIR}/L2/groups" -name "*.md" 2>/dev/null | wc -l | xargs)
@@ -507,7 +507,7 @@ phase_write() {
   log "WRITE — started (${total} components)"
 
   local i=0
-  parse_components | while IFS='|' read -r slug name path files; do
+  while IFS='|' read -r slug name path files; do
     i=$((i + 1))
 
     # Check if all three files exist (resume support)
@@ -578,7 +578,7 @@ ${HARD_RULES}"
         echo "- ${name} (${slug}): no docs produced after 2 attempts" >> "${DOCS_DIR}/builder/skipped-components.md"
       fi
     fi
-  done
+  done < <(parse_components)
 
   # Write group overviews (after all per-component docs)
   phase_write_groups
@@ -678,7 +678,7 @@ phase_review() {
     log "REVIEW — iteration ${iteration}/${max_iterations} (model: ${review_model})"
 
     local i=0
-    parse_components | while IFS='|' read -r slug name path files; do
+    while IFS='|' read -r slug name path files; do
       i=$((i + 1))
 
       # Skip if no docs exist
@@ -733,7 +733,7 @@ ${HARD_RULES}"
           log "REVIEW/${slug} — ❌ SKIPPED after retry (${i}/${total})"
         fi
       fi
-    done
+    done < <(parse_components)
 
     # Aggregation
     local issues
@@ -919,7 +919,7 @@ phase_update_comprehend() {
   total=$(count_components)
   local i=0
 
-  parse_components | while IFS='|' read -r slug name path files; do
+  while IFS='|' read -r slug name path files; do
     i=$((i + 1))
 
     local classification
@@ -938,6 +938,64 @@ phase_update_comprehend() {
 
     local files_int="${files//[^0-9]/}"
     files_int="${files_int:-0}"
+
+    # ── Trivial change detection ──────────────────────────────
+    # Use git log directly to check what actually changed in this component.
+    # Structural check — doesn't depend on how the diff agent worded things.
+    local is_trivial=false
+    local last_run_date=""
+    last_run_date=$(/usr/bin/awk -F': ' '/^date:/{print $2}' "${DOCS_DIR}/builder/last-run.md" 2>/dev/null)
+
+    if [[ -n "$last_run_date" && -n "$path" ]]; then
+      local changed_files=""
+      changed_files=$(cd "$REPO_PATH" && git log --since="$last_run_date" --name-only --pretty=format: -- "$path" | /usr/bin/sort -u | /usr/bin/grep '[^[:space:]]')
+      local changed_count=0
+      changed_count=$(echo "$changed_files" | /usr/bin/grep -c '[^[:space:]]' || true)
+      changed_count=${changed_count:-0}
+
+      # Count source code files (exclude config: json, yaml, yml, md, env, etc.)
+      local code_files=0
+      if [[ -n "$changed_files" ]]; then
+        code_files=$(echo "$changed_files" | /usr/bin/grep -cvE '\.(json|yaml|yml|config|env|md)$|package-lock' || true)
+        code_files=${code_files:-0}
+      fi
+
+      # Trivial if: files changed but none are source code (config-only)
+      if [[ "$changed_count" -gt 0 && "$code_files" -eq 0 ]] 2>/dev/null; then
+        is_trivial=true
+      fi
+
+      # Also trivial if: ≤1 file changed AND ≤5 net lines
+      if [[ "$changed_count" -le 1 ]] 2>/dev/null; then
+        local net_lines=0
+        net_lines=$(cd "$REPO_PATH" && git log --since="$last_run_date" --numstat --pretty=format: -- "$path" | /usr/bin/awk '{a+=$1;d+=$2}END{print a+d+0}')
+        if [[ "$net_lines" -le 5 && "$net_lines" -gt 0 ]] 2>/dev/null; then
+          is_trivial=true
+        fi
+      fi
+    fi
+
+    if [[ "$is_trivial" == "true" ]]; then
+      log "UPDATE_COMPREHEND/${slug} — trivial change, writing minimal summary"
+      # Extract the "What Changed" description from the affected components table
+      local what_changed=""
+      what_changed=$(awk -F'|' "/\`${slug}\`.*MODIFIED/ {gsub(/^[[:space:]]+|[[:space:]]+\$/,\"\",\$4); print \$4}" "${SCRATCH}/update-diff.md" 2>/dev/null | head -1)
+      cat > "${SCRATCH}/update-comprehend-${slug}-summary.md" << TRIVIAL_EOF
+# Updated Comprehend Summary: ${name}
+
+## Changes Since Last Run
+
+**Classification:** MODIFIED (trivial/config-only)
+
+### What Changed
+${what_changed:-Minor configuration change — see update-diff.md for details.}
+
+### Impact
+No functional code changes. Documentation impact is minimal — config values or settings updated.
+TRIVIAL_EOF
+      log "UPDATE_COMPREHEND/${slug} — complete (trivial)"
+      continue
+    fi
 
     # Minimal packages
     if (( files_int <= 3 )); then
@@ -1024,7 +1082,7 @@ ${HARD_RULES}"
         echo "- ${name} (${slug}): update comprehend failed after 2 attempts" >> "${DOCS_DIR}/builder/skipped-components.md"
       fi
     fi
-  done
+  done < <(parse_components)
 
   local summaries
   summaries=$(find "$SCRATCH" -name "update-comprehend-*-summary.md" 2>/dev/null | wc -l | xargs)
@@ -1114,6 +1172,31 @@ ${HARD_RULES}"
         local comprehend_file="${SCRATCH}/update-comprehend-${slug}-summary.md"
         if [[ ! -f "$comprehend_file" ]]; then
           comprehend_file="${SCRATCH}/comprehend-${slug}-summary.md"
+        fi
+
+        # Skip trivial changes — no doc update needed for config-only changes
+        # Check: if comprehend summary says trivial, OR if git shows only config files changed
+        local skip_trivial=false
+        if grep -q "trivial/config-only" "$comprehend_file" 2>/dev/null; then
+          skip_trivial=true
+        else
+          local last_run_date=""
+          last_run_date=$(/usr/bin/awk -F': ' '/^date:/{print $2}' "${DOCS_DIR}/builder/last-run.md" 2>/dev/null)
+          if [[ -n "$last_run_date" && -n "$path" ]]; then
+            local changed_code=0
+            changed_code=$(cd "$REPO_PATH" && git log --since="$last_run_date" --name-only --pretty=format: -- "$path" | /usr/bin/sort -u | /usr/bin/grep '[^[:space:]]' | /usr/bin/grep -cvE '\.(json|yaml|yml|config|env|md)$|package-lock' || true)
+            changed_code=${changed_code:-0}
+            local changed_any=0
+            changed_any=$(cd "$REPO_PATH" && git log --since="$last_run_date" --name-only --pretty=format: -- "$path" | /usr/bin/sort -u | /usr/bin/grep -c '[^[:space:]]' || true)
+            changed_any=${changed_any:-0}
+            if [[ "$changed_any" -gt 0 && "$changed_code" -eq 0 ]] 2>/dev/null; then
+              skip_trivial=true
+            fi
+          fi
+        fi
+        if [[ "$skip_trivial" == "true" ]]; then
+          log "UPDATE_DOCS/${slug} — trivial change, skipping doc update (${i}/${total})"
+          continue
         fi
 
         local task="SURGICALLY update documentation for '${name}' based on detected changes.
