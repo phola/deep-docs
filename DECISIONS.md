@@ -2,6 +2,14 @@
 
 Record of key design decisions for the deep-docs skill.
 
+## 2026-10-29: Source-grounded questions are the default
+
+**Decision:** Replace mandatory exhaustive comprehension/tier generation as the default with a bounded investigation workflow, retained evidence-backed answers, a small human-owned handbook and mechanical reference. Reuse existing agents and the static renderer rather than build a chat/wiki/indexing platform.
+
+**Safety:** Pin source revisions, preserve source and existing human material, keep semantic review distinct from citation-byte validation, make unknown freshness impact visible, and retain failed-run evidence. Local controlled execution does not establish live operational facts or commercial-product superiority.
+
+**Legacy:** Keep the tiered engine and useful historical output available, with fail-closed invocation/resume/budget/model handling. Historical exhaustive-generation decisions below describe that optional engine, not the recommended default. A partial draft does not advance a full-audit successful baseline.
+
 ## 2026-03-07: Bottom-up comprehension loops
 
 **Decision:** Document repos through iterative comprehension loops (inventory → data → logic → errors) rather than "read everything then write."

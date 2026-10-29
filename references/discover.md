@@ -104,6 +104,9 @@ OUTPUT two files:
 | 1 | Content Library | content-library | workspaces/modules/content_library/ | cl-fun-api, cl-lib-db, cl-lib-models, ... | Media catalogue and metadata management |
 | 2 | Shared Platform | shared-platform | workspaces/common/ | buzz-lib-db, buzz-lib-events, ... | Cross-cutting libraries used by all modules |
 
+- List standalone component slugs under `## Standalone Components` using a table with
+  columns `| Component | Path | Reason |`. Each component occurs once: either in a group
+  or in this standalone table. Preserve the existing `## Singleton Modules` format on updates.
 - If no meaningful groups detected (e.g., flat repo with <5 components), write
   the file with an empty table and a note: "No component groups detected — all
   components are standalone."

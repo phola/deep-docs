@@ -1,103 +1,60 @@
-# deep-docs
+# DeepDocs
 
-An [OpenClaw](https://github.com/openclaw/openclaw) agent skill that generates deep, multi-audience documentation for any code repository. It works bottom-up — reading every source file through iterative comprehension loops — and produces tiered output from executive summaries down to machine-readable inventories.
+Source-grounded repository understanding: **small maintained handbook, bounded questions, and mechanical reference**. Preserve useful explanations instead of requiring an exhaustive generated encyclopaedia before anyone can use the output.
 
-**Never modifies source code. Documents the as-is state only.**
+**Source stays read-only. Generated explanations are drafts, not runtime or whole-repository certification.**
 
-## What it produces
+## Recommended workflow
 
-| Tier | Audience | Content |
-|------|----------|---------|
-| **L1** | Leadership, stakeholders | 1-page executive summary, no code |
-| **L2** | Product managers, BAs | Data flows, business rules, diagrams. 2–4 pages per component |
-| **L2-Group** | Architects, tech leads | Subsystem overviews grouping related packages |
-| **L3** | Developers | Architecture, patterns, gotchas, code references |
-| **L4** | AI agents | Structured inventory — headings, tables, code blocks, no prose |
+Use `scripts/grounded.py` with Python 3.11+, Git and a POSIX host (Linux/macOS). It uses the standard library for source identity, question/evidence records, verification and freshness. Rendering reuses MkDocs; there is no required vector database, graph service, hosted wiki or model SDK.
 
-Plus Mermaid diagrams, a review report, and (in update mode) a changelog.
+1. Initialise a dedicated output directory from a clean Git checkout. The source revision is pinned; existing docs are not imported as unquestioned facts or rewritten.
+2. Ask a small number of useful questions. Use an existing authorised agent to locate entry points, follow relevant definitions/configuration/tests and answer from that source snapshot.
+3. Retain worthwhile answers with exact source spans, explicit unknowns, dependencies and agent/model metadata. Keep human intent separate from code-derived facts.
+4. Verify citation bytes and artifact integrity, then review whether the cited implementation actually supports each claim.
+5. Build a compact static site with an index, mechanical package/project reference and retained answers. Deployment is a separate action.
+6. Check freshness after source changes. Changed evidence or uncertain impact means review is needed; it is not permission to silently carry old claims forward.
 
-## Modes
+See [the command and answer contract](references/grounded-workflow.md) for executable examples, adapter details, limits and failure behaviour.
 
-| Mode | Use case |
-|------|----------|
-| `init` | Full documentation from scratch |
-| `update` | Incremental update after code changes (diff-driven) |
-| `history` | Retrospective changelog from git history |
+### Important limits
 
-## How it works
+- Citation validation proves that quoted source exists at the pinned revision. It does **not** prove semantic correctness; accepted answers remain explicitly unreviewed until separately assessed.
+- A dependency watch list is not a complete dependency graph. Unknown-impact changes must remain visible rather than being labelled unaffected.
+- Source cannot establish the currently deployed version, live configuration, actual permissions or business intent by itself. Those need separately authorised evidence or human input.
+- A provider-neutral runner is optional. Its local process/cumulative limits do not measure manual/out-of-band agent spend. Exact model/cost data may be unknown and must not be invented.
+- Local source access does not imply local inference. Only use approved model endpoints; do not send private code to a new commercial service by default.
+- This first slice is not a chat service, language-server implementation or self-updating documentation platform. Existing navigation and agent tools do the investigation.
 
-1. **Interview** — interactive Q&A to understand the repo  
-2. **Discover** — walk the repo, build a component inventory  
-3. **Calibrate** — auto-select profile (small / medium / large) based on repo size  
-4. **Comprehend** — iterative deep-read of each component (3–7 loops depending on size)  
-5. **Synthesise** — cross-component analysis, dependency mapping  
-6. **Diagram** — generate Mermaid architecture and flow diagrams  
-7. **Write** — produce L1–L4 docs per component, groups, and overviews  
-8. **Review** — multi-pass review verifying docs against source code  
-9. **Package** — optional mkdocs site generation  
+## Existing tiered documentation
 
-Per-component phases are driven by a bash orchestrator (`scripts/orchestrate.sh`) that spawns one sub-agent per component — avoiding the "do 87 things" completion bias where LLMs sample and declare success.
+The legacy Bash/OpenClaw engine remains available for an explicitly requested full tiered run or compatible existing outputs. It is **not the recommended default** for a new repository question.
 
-## Quick start
+It supports L1 leadership summaries, L2 product/group explanations, L3 developer guides and L4 structured reference. Existing output, human-authored sections and failed/incomplete review evidence remain valuable; replacing the default workflow does not delete or certify them.
 
-Requires [OpenClaw](https://github.com/openclaw/openclaw) with an LLM provider configured (Anthropic recommended).
+See [legacy orchestration](SKILL.md#legacy-tiered-workflow), [incremental updates](references/update.md), [review](references/review.md) and [legacy safety fixes](references/legacy-safety-fixes.md). Review resumes and retries must respect source/artifact identity, invocation failures, budgets and honest completeness. A successful static build is not a successful semantic audit.
+
+## Verification
 
 ```bash
-# Install as an OpenClaw skill
-cp -r deep-docs ~/.openclaw/skills/deep-docs
-
-# Full run
-./scripts/orchestrate.sh all /path/to/repo /path/to/docs
-
-# Individual phases (resume/retry)
-./scripts/orchestrate.sh discover /path/to/repo /path/to/docs
-./scripts/orchestrate.sh comprehend /path/to/repo /path/to/docs
-./scripts/orchestrate.sh write /path/to/repo /path/to/docs
-./scripts/orchestrate.sh review /path/to/repo /path/to/docs
+# For real-renderer checks, install mkdocs-material on PATH or set
+# DEEPDOCS_MKDOCS_BIN to an existing mkdocs executable before these commands.
+python3 -B tests/test-grounded.py
+bash tests/test-orchestrate.sh
+python3 -B tests/test-update-cli.py
+python3 -B tests/test-package-site.py
 ```
 
-Or just ask your OpenClaw agent: *"document this repo"* and it will pick up the skill automatically.
+Offline synthetic answers test lifecycle and validation behaviour, not model accuracy. Actual source-grounded investigations and semantic review must be reported separately. No private source, generated private answers, credentials or operational captures belong in this public tool repository.
 
-## Model routing
+## Layout
 
-Two tiers balance quality and cost:
-
-| Tier | Used for | Default |
-|------|----------|---------|
-| **Quality** | comprehend, synthesise, write, review pass 2+ | claude-opus-4-6 |
-| **Economy** | discover, review pass 1, diagram | claude-sonnet-4-6 |
-
-```bash
-# Max quality — disable economy model
-DEEP_DOCS_ECONOMY_MODEL="" ./scripts/orchestrate.sh all /path/to/repo /path/to/docs
-
-# Custom economy model
-DEEP_DOCS_ECONOMY_MODEL="openai/gpt-4o-mini" ./scripts/orchestrate.sh all /path/to/repo /path/to/docs
-```
-
-## Repo structure
-
-```
-SKILL.md                    # OpenClaw skill definition
-scripts/orchestrate.sh      # Bash orchestrator — drives all phases
-references/
-  interview.md              # Interview phase guide
-  discover.md               # Component discovery
-  calibrate.md              # Auto-calibration profiles
-  comprehend.md             # Iterative comprehension loops
-  synthesise.md             # Cross-component synthesis
-  diagram.md                # Mermaid diagram generation
-  write.md                  # Doc writing (L1–L4)
-  review.md                 # Multi-pass review
-  package.md                # mkdocs packaging
-  update.md                 # Incremental update mode
-  history.md                # Retrospective changelog mode
-  audience-tiers.md         # L1–L4 tier definitions
-```
-
-## Battle-tested
-
-Successfully run against a 170+ component enterprise monorepo (~15,500 source files), producing 500+ documentation files across all tiers with automated review catching 519 issues.
+- `scripts/grounded.py` — bounded source/evidence workflow.
+- `references/grounded-workflow.md` — commands, schema and operational limits.
+- `references/thin-implementation-contract.md` — first-slice acceptance boundaries.
+- `scripts/orchestrate.sh` — retained tiered engine.
+- `references/` — phase guides and implementation decisions.
+- `tests/` — disposable Git/CLI and real-renderer regressions.
 
 ## License
 

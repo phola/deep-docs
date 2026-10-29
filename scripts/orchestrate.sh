@@ -18,13 +18,21 @@ PROGRESS="${DOCS_DIR}/builder/progress.md"
 INVENTORY="${DOCS_DIR}/builder/specs/component-inventory.md"
 SCRATCH="${DOCS_DIR}/builder/.scratch"
 TIMEOUT=1800  # 30 min per sub-agent
+LAST_RUN_FILE="${DOCS_DIR}/builder/last-run.md"
+UPDATE_STATE_FILE="${SCRATCH}/update-run-state"
+REVIEW_SCOPE_FILE="${SCRATCH}/review-scope.psv"
+REVIEW_STATE_FILE="${SCRATCH}/review-run-state"
+BASE_COMMIT=""
+HEAD_COMMIT=""
+UPDATE_RUN_KEY=""
 
 # Model routing strategy:
 # - QUALITY_MODEL  : comprehend, synthesise, write (accuracy matters most)
 # - ECONOMY_MODEL  : discover, review pass 1, diagram (mechanical/structural tasks)
 # Override ECONOMY_MODEL to "" to use QUALITY_MODEL everywhere (max quality mode).
 QUALITY_MODEL="${MODEL}"
-ECONOMY_MODEL="${DEEP_DOCS_ECONOMY_MODEL:-anthropic/claude-sonnet-4-6}"
+ECONOMY_MODEL="${DEEP_DOCS_ECONOMY_MODEL-anthropic/claude-sonnet-4-6}"
+AGENT_ADAPTER="${DEEP_DOCS_AGENT_ADAPTER:-openclaw}"
 
 # Helper: pick model based on quality requirement
 model_for() {
@@ -62,7 +70,8 @@ trim() {
   echo "$val"
 }
 
-parse_components() {
+parse_components_file() {
+  local inventory_file="$1"
   # Pre-extract with awk to avoid subshell PATH issues
   /usr/bin/awk -F'|' '/^\| [0-9]/ {
     gsub(/`/, "", $4); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4);  # slug
@@ -70,7 +79,11 @@ parse_components() {
     gsub(/`/, "", $5); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5);  # path
     gsub(/`/, "", $6); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6);  # files
     if ($4 != "") print $4 "|" $3 "|" $5 "|" $6
-  }' "$INVENTORY"
+  }' "$inventory_file"
+}
+
+parse_components() {
+  parse_components_file "$INVENTORY"
 }
 
 # Derive a deterministic slug from a component path.
@@ -123,27 +136,792 @@ count_components() {
   parse_components | wc -l | xargs
 }
 
-# Spawn a sub-agent and wait for completion
-# Usage: spawn_agent <task> <label> [timeout] [model]
-# Note: openclaw agent --local uses agents.defaults.model.primary from openclaw.json.
-# Per-invocation model switching is not supported by the CLI.
-# To run with Opus: set agents.defaults.model.primary to anthropic/claude-opus-4-6
-# in ~/.openclaw/openclaw.json before running the orchestrator.
-# The [model] argument is accepted for future compatibility but currently ignored.
+read_last_run_field() {
+  local field="$1"
+  [[ -f "$LAST_RUN_FILE" ]] || return 0
+  /usr/bin/awk -F':' -v key="$field" '$1 == key {
+    sub(/^[^:]*:[[:space:]]*/, ""); print; exit
+  }' "$LAST_RUN_FILE"
+}
+
+# Resolve the source baseline used by every update sub-phase. New records pin the
+# exact source commit; legacy date-only records fall back to the last commit at
+# or before the timestamp so the first later commit is not omitted.
+resolve_baseline_commit() {
+  local recorded_commit last_run_date
+  recorded_commit=$(read_last_run_field commit)
+  if [[ -n "$recorded_commit" ]]; then
+    if git -C "$REPO_PATH" cat-file -e "${recorded_commit}^{commit}" 2>/dev/null; then
+      git -C "$REPO_PATH" rev-parse "${recorded_commit}^{commit}"
+      return 0
+    fi
+    echo "Recorded last-run commit is not available: $recorded_commit" >&2
+    return 1
+  fi
+
+  last_run_date=$(read_last_run_field date)
+  if [[ -n "$last_run_date" ]]; then
+    local legacy_commit
+    legacy_commit=$(git -C "$REPO_PATH" rev-list -1 --before="$last_run_date" HEAD 2>/dev/null || true)
+    if [[ -n "$legacy_commit" ]]; then
+      printf '%s\n' "$legacy_commit"
+      return 0
+    fi
+    echo "No source commit exists at or before legacy last-run date: $last_run_date" >&2
+    return 1
+  fi
+  echo "Missing usable commit/date baseline in $LAST_RUN_FILE" >&2
+  return 1
+}
+
+validate_reproducible_source() {
+  local repo_root docs_real docs_rel=""
+  repo_root=$(git -C "$REPO_PATH" rev-parse --show-toplevel 2>/dev/null) || return 1
+  docs_real=$(cd "$DOCS_DIR" 2>/dev/null && pwd -P) || return 1
+  repo_root=$(cd "$repo_root" && pwd -P)
+  if [[ "$docs_real" == "$repo_root"/* ]]; then
+    docs_rel=${docs_real#"${repo_root}/"}
+  fi
+
+  local pathspecs=(.)
+  if [[ -n "$docs_rel" ]]; then
+    pathspecs+=(":(exclude)${docs_rel}/**")
+  fi
+  if ! git -C "$repo_root" diff --quiet HEAD -- "${pathspecs[@]}" ||
+     ! git -C "$repo_root" diff --cached --quiet HEAD -- "${pathspecs[@]}"; then
+    echo "Source repository has tracked changes outside the documentation output: $repo_root" >&2
+    return 1
+  fi
+
+  local untracked
+  untracked=$(git -C "$repo_root" ls-files --others --exclude-standard | while IFS= read -r source_path; do
+    if [[ -z "$docs_rel" || ( "$source_path" != "$docs_rel" && "$source_path" != "$docs_rel"/* ) ]]; then
+      printf '%s\n' "$source_path"
+    fi
+  done)
+  if [[ -n "$untracked" ]]; then
+    echo "Source repository has untracked files outside the documentation output:" >&2
+    printf '%s\n' "$untracked" >&2
+    return 1
+  fi
+}
+
+# Clear only source-range-specific update artifacts. Re-running the exact same
+# baseline..target range keeps them for resume; a different range cannot reuse them.
+prepare_update_run_state() {
+  mkdir -p "$SCRATCH"
+  validate_reproducible_source || {
+    log "UPDATE_STATE — ❌ source is not a reproducible clean Git tree"
+    return 1
+  }
+  local existing_key
+  HEAD_COMMIT=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null) || {
+    log "UPDATE_STATE — ❌ source repository has no readable HEAD"
+    return 1
+  }
+  if [[ -z "$BASE_COMMIT" ]]; then
+    BASE_COMMIT=$(resolve_baseline_commit) || {
+      log "UPDATE_STATE — ❌ no trustworthy update baseline"
+      return 1
+    }
+  fi
+  if ! git -C "$REPO_PATH" merge-base --is-ancestor "$BASE_COMMIT" "$HEAD_COMMIT" 2>/dev/null; then
+    log "UPDATE_STATE — ❌ baseline ${BASE_COMMIT} is not an ancestor of target ${HEAD_COMMIT}"
+    return 1
+  fi
+  UPDATE_RUN_KEY="${BASE_COMMIT}..${HEAD_COMMIT}"
+  existing_key=""
+  [[ -f "$UPDATE_STATE_FILE" ]] && existing_key=$(<"$UPDATE_STATE_FILE")
+
+  if [[ "$existing_key" != "$UPDATE_RUN_KEY" ]]; then
+    # These are successful-baseline snapshots, not target-range caches. A failed
+    # A..B refresh must not become the old inventory when retrying A..C.
+    if [[ "${existing_key%%..*}" == "$BASE_COMMIT" && -f "${SCRATCH}/inventory-before-update.md" ]]; then
+      cp "${SCRATCH}/inventory-before-update.md" "$INVENTORY" || return 1
+      if [[ -f "${SCRATCH}/component-groups-before-update.md" ]]; then
+        cp "${SCRATCH}/component-groups-before-update.md" "${DOCS_DIR}/builder/specs/component-groups.md" || return 1
+      else
+        rm -f "${DOCS_DIR}/builder/specs/component-groups.md"
+      fi
+    else
+      rm -f "${SCRATCH}/inventory-before-update.md" \
+        "${SCRATCH}/component-groups-before-update.md"
+    fi
+    rm -f \
+      "${SCRATCH}/update-diff.md" \
+      "${SCRATCH}/git-diff-raw.md" \
+      "${SCRATCH}/inventory-refresh-complete.md" \
+      "${SCRATCH}/inventory-delta.md" \
+      "${REVIEW_SCOPE_FILE}" \
+      "${REVIEW_STATE_FILE}" \
+      "${SCRATCH}"/update-comprehend-*-summary.md
+    printf '%s\n' "$UPDATE_RUN_KEY" > "$UPDATE_STATE_FILE"
+    log "UPDATE_STATE — fresh source range (${UPDATE_RUN_KEY}); stale update artifacts invalidated"
+  else
+    log "UPDATE_STATE — resuming source range (${UPDATE_RUN_KEY})"
+  fi
+}
+
+assert_update_head_unchanged() {
+  local live_head
+  [[ -n "$HEAD_COMMIT" ]] || {
+    echo "Update target commit has not been pinned" >&2
+    return 1
+  }
+  live_head=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null) || return 1
+  if [[ "$live_head" != "$HEAD_COMMIT" ]]; then
+    echo "Source HEAD changed during update: expected $HEAD_COMMIT, found $live_head" >&2
+    return 1
+  fi
+  validate_reproducible_source
+}
+
+# Preserve established slugs for surviving component paths and unique same-name
+# path moves; derive slugs only for genuinely new component identities.
+reconcile_inventory_slugs() {
+  local old_inventory="$1"
+  local new_inventory="$2"
+  local tmp="${new_inventory}.tmp" mapping="${new_inventory}.slug-map.tmp"
+  : > "$mapping"
+  /usr/bin/awk -F'|' -v mapping="$mapping" '
+    BEGIN { OFS = "|" }
+    function clean(v) { gsub(/`/, "", v); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); return v }
+    NR == FNR {
+      if ($0 ~ /^\| [0-9]/) {
+        old_slug[clean($5)] = clean($4)
+        old_name = clean($3)
+        old_name_count[old_name]++
+        old_slug_by_name[old_name] = clean($4)
+      }
+      next
+    }
+    /^\| [0-9]/ {
+      path = clean($5)
+      component_name = clean($3)
+      if (path in old_slug) {
+        slug = old_slug[path]
+      } else if (old_name_count[component_name] == 1) {
+        # A unique same-name component at a new path is a move; keep its identity.
+        slug = old_slug_by_name[component_name]
+      } else if (path == "." || path == "./") {
+        slug = "repository-root"
+      } else {
+        n = split(path, parts, "/")
+        slug = tolower(parts[n])
+        gsub(/_/, "-", slug)
+      }
+      candidate = clean($4)
+      if (candidate != slug) print candidate "|" slug >> mapping
+      $4 = " `" slug "` "
+      print
+      next
+    }
+    { print }
+  ' "$old_inventory" "$new_inventory" > "$tmp" && mv "$tmp" "$new_inventory" || {
+    rm -f "$tmp" "$mapping"; return 1;
+  }
+  # The inventory and its membership references are one identity graph. Agent
+  # choices of temporary slugs must not leave groups pointing at replaced IDs.
+  local groups_file="${DOCS_DIR}/builder/specs/component-groups.md"
+  if [[ -s "$mapping" && -f "$groups_file" ]]; then
+    /usr/bin/awk -F'|' '
+      BEGIN { OFS="|" }
+      function clean(v) { gsub(/`/, "", v); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); return v }
+      FILENAME == ARGV[1] { renamed[$1]=$2; next }
+      /^##[[:space:]]/ { standalone=(tolower($0) ~ /^## (singleton|standalone)/) }
+      /^\| [0-9]/ {
+        n=split(clean($6), members, ","); value=""
+        for (i=1;i<=n;i++) {
+          member=clean(members[i]); if (member in renamed) member=renamed[member]
+          value=value (i>1 ? ", " : "") member
+        }
+        $6=" " value " "
+      }
+      standalone && /^\|/ { member=clean($2); if (member in renamed) $2=" `" renamed[member] "` " }
+      { print }
+    ' "$mapping" "$groups_file" > "${groups_file}.tmp" && mv "${groups_file}.tmp" "$groups_file" || {
+      rm -f "$mapping" "${groups_file}.tmp"; return 1;
+    }
+  fi
+  rm -f "$mapping"
+}
+
+write_inventory_delta() {
+  local old_inventory="$1"
+  local new_inventory="$2"
+  local output="$3"
+  local tmp
+  tmp=$(mktemp)
+  declare -A old_slug_by_path=() old_name_by_path=() old_path_by_slug=()
+  declare -A new_slug_by_path=() new_name_by_path=() moved_slugs=()
+  local slug name path files old_path
+  while IFS='|' read -r slug name path files; do
+    old_slug_by_path["$path"]="$slug"
+    old_name_by_path["$path"]="$name"
+    old_path_by_slug["$slug"]="$path"
+  done < <(parse_components_file "$old_inventory")
+  while IFS='|' read -r slug name path files; do
+    new_slug_by_path["$path"]="$slug"
+    new_name_by_path["$path"]="$name"
+  done < <(parse_components_file "$new_inventory")
+
+  for path in "${!new_slug_by_path[@]}"; do
+    if [[ -z "${old_slug_by_path[$path]+x}" ]]; then
+      slug=${new_slug_by_path[$path]}
+      old_path=${old_path_by_slug[$slug]:-}
+      if [[ -n "$old_path" && -z "${new_slug_by_path[$old_path]+x}" ]]; then
+        printf '| `%s` | STRUCTURAL | %s | `%s` → `%s` |\n' "$slug" "${new_name_by_path[$path]}" "$old_path" "$path" >> "$tmp"
+        moved_slugs["$slug"]=1
+      else
+        printf '| `%s` | NEW | %s | `%s` |\n' "$slug" "${new_name_by_path[$path]}" "$path" >> "$tmp"
+      fi
+    fi
+  done
+  for path in "${!old_slug_by_path[@]}"; do
+    slug=${old_slug_by_path[$path]}
+    if [[ -z "${new_slug_by_path[$path]+x}" && -z "${moved_slugs[$slug]+x}" ]]; then
+      printf '| `%s` | REMOVED | %s | `%s` |\n' "$slug" "${old_name_by_path[$path]}" "$path" >> "$tmp"
+    fi
+  done
+
+  {
+    echo "# Component Inventory Delta"
+    echo
+    echo "| Slug | Classification | Component | Path |"
+    echo "|------|----------------|-----------|------|"
+    sort "$tmp"
+  } > "$output"
+  rm -f "$tmp"
+}
+
+validate_inventory() {
+  local inventory_file="${1:-$INVENTORY}"
+  local count=0
+  declare -A seen_slugs=() seen_paths=()
+  local slug name path files
+  while IFS='|' read -r slug name path files; do
+    count=$((count + 1))
+    if [[ ! "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ || -z "$path" ]]; then
+      echo "Invalid inventory row: malformed slug or missing path" >&2
+      return 1
+    fi
+    if [[ -n "${seen_slugs[$slug]+x}" ]]; then
+      echo "Duplicate inventory slug: $slug" >&2
+      return 1
+    fi
+    if [[ -n "${seen_paths[$path]+x}" ]]; then
+      echo "Duplicate inventory path: $path" >&2
+      return 1
+    fi
+    seen_slugs["$slug"]=1
+    seen_paths["$path"]=1
+    if [[ "${DEEP_DOCS_SKIP_PATH_VALIDATION:-0}" != "1" && ! -e "${REPO_PATH}/${path}" ]]; then
+      echo "Inventory path does not exist in source: $path" >&2
+      return 1
+    fi
+  done < <(parse_components_file "$inventory_file")
+  if (( count == 0 )); then
+    echo "Inventory contains no components: $inventory_file" >&2
+    return 1
+  fi
+}
+
+build_review_scope() {
+  local output="${1:-$REVIEW_SCOPE_FILE}"
+  local tmp="${output}.tmp"
+  : > "$tmp"
+  if [[ -f "${SCRATCH}/update-diff.md" && "$PHASE" == "update" ]]; then
+    local slug classification component
+    while IFS='|' read -r slug classification; do
+      [[ "$classification" == "REMOVED" ]] && continue
+      component=$(parse_components | /usr/bin/awk -F'|' -v wanted="$slug" '$1 == wanted { print; exit }')
+      if [[ -z "$component" ]]; then
+        echo "Affected component is missing from inventory: $slug" >&2
+        rm -f "$tmp"
+        return 1
+      fi
+      printf '%s\n' "$component" >> "$tmp"
+    done < <(parse_affected_components)
+  else
+    parse_components > "$tmp"
+  fi
+  /usr/bin/awk '!seen[$1]++' "$tmp" > "$output"
+  rm -f "$tmp"
+}
+
+review_status() {
+  local review_file="$1"
+  [[ -f "$review_file" ]] || return 1
+  /usr/bin/awk '
+    {
+      line = $0
+      gsub(/\r$/, "", line)
+      if (line == "COMPONENT_CLEAN" || line ~ /^COMPONENT_ISSUES: [0-9]+ unresolved$/) markers++
+      if (line ~ /[^[:space:]]/) last = line
+    }
+    END {
+      if (markers != 1) exit 1
+      if (last == "COMPONENT_CLEAN") print "clean"
+      else if (last ~ /^COMPONENT_ISSUES: [0-9]+ unresolved$/) print "issues"
+      else exit 1
+    }
+  ' "$review_file"
+}
+
+review_input_fingerprint() {
+  local slug="$1"
+  local source_commit="${HEAD_COMMIT:-}"
+  [[ -n "$source_commit" ]] || source_commit=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || echo no-head)
+  local tier file
+  for tier in L2 L3 L4; do
+    [[ -f "${DOCS_DIR}/${tier}/${slug}.md" ]] || return 1
+  done
+  {
+    printf 'slug=%s\nsource=%s\n' "$slug" "$source_commit"
+    for tier in L2 L3 L4; do
+      file="${DOCS_DIR}/${tier}/${slug}.md"
+      /usr/bin/sha256sum "$file"
+    done
+  } | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+}
+
+review_fingerprint_matches() {
+  local slug="$1"
+  local fingerprint_file="${SCRATCH}/review-${slug}.fingerprint"
+  [[ -f "$fingerprint_file" ]] || return 1
+  [[ "$(<"$fingerprint_file")" == "$(review_input_fingerprint "$slug")" ]]
+}
+
+review_scope_counts() {
+  local scope_file="$1"
+  local clean=0 issues=0 unknown=0 total=0
+  local slug name path files status
+  while IFS='|' read -r slug name path files; do
+    [[ -z "$slug" ]] && continue
+    total=$((total + 1))
+    status=$(review_status "${SCRATCH}/review-${slug}.md" 2>/dev/null || true)
+    if [[ "$status" == "clean" ]] && ! review_fingerprint_matches "$slug"; then
+      status=""
+    fi
+    case "$status" in
+      clean) clean=$((clean + 1)) ;;
+      issues) issues=$((issues + 1)) ;;
+      *) unknown=$((unknown + 1)) ;;
+    esac
+  done < "$scope_file"
+  printf '%s|%s|%s|%s\n' "$clean" "$issues" "$unknown" "$total"
+}
+
+review_aggregate_fingerprint() {
+  [[ -s "${DOCS_DIR}/REVIEW.md" ]] || return 1
+  {
+    /usr/bin/sha256sum "$REVIEW_SCOPE_FILE" "$REVIEW_STATE_FILE" "${DOCS_DIR}/REVIEW.md"
+    local slug name path files
+    while IFS='|' read -r slug name path files; do
+      /usr/bin/sha256sum "${SCRATCH}/review-${slug}.md" "${SCRATCH}/review-${slug}.fingerprint" || return 1
+      review_input_fingerprint "$slug" || return 1
+    done < "$REVIEW_SCOPE_FILE"
+  } | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+}
+
+verify_review_scope() {
+  local scope_file="${1:-$REVIEW_SCOPE_FILE}"
+  [[ -f "$scope_file" ]] || return 1
+  local counts clean issues unknown total
+  counts=$(review_scope_counts "$scope_file")
+  IFS='|' read -r clean issues unknown total <<< "$counts"
+  if (( total == 0 )); then
+    is_removal_only_update && validate_update_outputs &&
+      system_review_is_clean &&
+      [[ -s "${SCRATCH}/review-system.fingerprint" &&
+         "$(<"${SCRATCH}/review-system.fingerprint")" == "$(system_review_fingerprint)" ]]
+    return $?
+  fi
+  if (( clean != total || issues > 0 || unknown > 0 )); then
+    echo "Review scope incomplete: clean=${clean}, issues=${issues}, unknown=${unknown}, total=${total}" >&2
+    return 1
+  fi
+}
+
+extract_mkdocs_nav_targets() {
+  local mkdocs_file="$1"
+  /usr/bin/awk '
+    /^nav:[[:space:]]*$/ { in_nav=1; next }
+    in_nav && /^[^[:space:]#]/ { exit }
+    in_nav && /\.md/ { print }
+  ' "$mkdocs_file" | while IFS= read -r line; do
+    local target="${line##*: }"
+    target="${target%%#*}"
+    target=$(printf '%s' "$target" | xargs)
+    target="${target#\"}"; target="${target%\"}"
+    target="${target#\'}"; target="${target%\'}"
+    [[ "$target" == *.md ]] && printf '%s\n' "$target"
+  done
+}
+
+validate_site_navigation() {
+  local mkdocs_file="${DOCS_DIR}/mkdocs.yml"
+  [[ -f "$mkdocs_file" ]] || {
+    echo "Missing mkdocs.yml" >&2
+    return 1
+  }
+
+  local nav_targets="${SCRATCH}/mkdocs-nav-targets.txt"
+  mkdir -p "$SCRATCH"
+  extract_mkdocs_nav_targets "$mkdocs_file" | /usr/bin/sort -u > "$nav_targets"
+  [[ -s "$nav_targets" ]] || {
+    echo "mkdocs.yml has no parseable nav targets" >&2
+    return 1
+  }
+
+  local doc relative target
+  while IFS= read -r doc; do
+    relative="${doc#${DOCS_DIR}/}"
+    if ! /usr/bin/grep -Fxq -- "$relative" "$nav_targets"; then
+      echo "Documentation file missing from MkDocs navigation: $relative" >&2
+      return 1
+    fi
+  done < <(
+    {
+      [[ -f "${DOCS_DIR}/index.md" ]] && printf '%s\n' "${DOCS_DIR}/index.md"
+      find "${DOCS_DIR}/L1" "${DOCS_DIR}/L2" "${DOCS_DIR}/L3" "${DOCS_DIR}/L4" "${DOCS_DIR}/diagrams" -type f -name '*.md' 2>/dev/null
+      [[ -f "${DOCS_DIR}/CHANGELOG.md" ]] && printf '%s\n' "${DOCS_DIR}/CHANGELOG.md"
+      [[ -f "${DOCS_DIR}/REVIEW.md" ]] && printf '%s\n' "${DOCS_DIR}/REVIEW.md"
+    } | sort -u
+  )
+
+  while IFS= read -r target; do
+    if [[ ! -f "${DOCS_DIR}/${target}" ]]; then
+      echo "MkDocs navigation target does not exist: $target" >&2
+      return 1
+    fi
+  done < "$nav_targets"
+}
+
+# Discovery permits standalone components, represented separately from groups.
+parse_standalone_components() {
+  local groups_file="${DOCS_DIR}/builder/specs/component-groups.md"
+  [[ -f "$groups_file" ]] || return 0
+  /usr/bin/awk -F'|' '
+    /^##[[:space:]]/ { standalone = (tolower($0) ~ /^## (singleton|standalone)/) }
+    standalone && /^\|/ {
+      slug=$2; gsub(/`/, "", slug); gsub(/^[[:space:]]+|[[:space:]]+$/, "", slug)
+      if (slug != "" && tolower(slug) != "component" && slug !~ /^[-:]+$/) print slug
+    }
+  ' "$groups_file"
+}
+
+validate_component_groups() {
+  local groups_file="${DOCS_DIR}/builder/specs/component-groups.md"
+  [[ -f "$groups_file" ]] || return 0
+  local group_total all_standalone=false
+  group_total=$(count_groups)
+  if (( group_total == 0 )) && grep -Fxq 'No component groups detected — all components are standalone.' "$groups_file"; then
+    all_standalone=true
+  fi
+
+  declare -A inventory_slugs=() grouped_slugs=() group_slugs=()
+  local slug name path files group_slug group_name path_prefix components member member_count
+  local -a members
+  while IFS='|' read -r slug name path files; do inventory_slugs["$slug"]=1; done < <(parse_components)
+  while IFS='|' read -r group_slug group_name path_prefix components; do
+    if [[ ! "$group_slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ || -n "${group_slugs[$group_slug]+x}" ]]; then
+      echo "Invalid or duplicate component-group slug: $group_slug" >&2
+      return 1
+    fi
+    group_slugs["$group_slug"]=1
+    IFS=',' read -ra members <<< "$components"
+    member_count=0
+    for member in "${members[@]}"; do
+      member=$(printf '%s' "$member" | tr -d '\140' | xargs)
+      [[ -z "$member" ]] && continue
+      if [[ -z "${inventory_slugs[$member]+x}" ]]; then
+        echo "Component group references unknown slug: $member" >&2
+        return 1
+      fi
+      if [[ -n "${grouped_slugs[$member]+x}" ]]; then
+        echo "Component appears more than once in group membership: $member" >&2
+        return 1
+      fi
+      grouped_slugs["$member"]="$group_slug"
+      member_count=$((member_count + 1))
+    done
+    if (( member_count == 0 )); then
+      echo "Component group has no members: $group_slug" >&2
+      return 1
+    fi
+  done < <(parse_groups)
+  while IFS= read -r member; do
+    if [[ -z "${inventory_slugs[$member]+x}" || -n "${grouped_slugs[$member]+x}" ]]; then
+      echo "Unknown or duplicate standalone component: $member" >&2
+      return 1
+    fi
+    grouped_slugs["$member"]="standalone"
+  done < <(parse_standalone_components)
+  for slug in "${!inventory_slugs[@]}"; do
+    if [[ "$all_standalone" != true && -z "${grouped_slugs[$slug]+x}" ]]; then
+      echo "Current component is neither grouped nor explicitly standalone: $slug" >&2
+      return 1
+    fi
+  done
+}
+
+# Unlike affected-output checks, no-change must inspect the entire inherited site.
+validate_current_docs() {
+  validate_inventory "$INVENTORY" && validate_component_groups || return 1
+  local slug name path files tier required
+  while IFS='|' read -r slug name path files; do
+    for tier in L2 L3 L4; do
+      [[ -s "${DOCS_DIR}/${tier}/${slug}.md" ]] || {
+        echo "Current component has missing or empty ${tier} documentation: $slug" >&2
+        return 1
+      }
+    done
+  done < <(parse_components)
+  for required in L1/executive-summary.md L2/overview.md L4/OVERVIEW.md diagrams/INDEX.md index.md; do
+    [[ -s "${DOCS_DIR}/${required}" ]] || { echo "Missing required documentation: $required" >&2; return 1; }
+  done
+  while IFS='|' read -r slug name path files; do
+    [[ -s "${DOCS_DIR}/L2/groups/${slug}.md" ]] || { echo "Missing group documentation: $slug" >&2; return 1; }
+  done < <(parse_groups)
+}
+
+prepare_mkdocs_source_view() {
+  # Keep authoritative root docs in place. MkDocs requires a child source tree;
+  # relative symlinks expose only published roots, never builder/.git/scratch.
+  local config="${DOCS_DIR}/mkdocs.yml" docs_path site_path
+  docs_path=$(/usr/bin/awk '/^docs_dir:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); print; exit}' "$config" | xargs)
+  site_path=$(/usr/bin/awk '/^site_dir:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); print; exit}' "$config" | xargs)
+  if [[ "${docs_path:-docs}" != "docs" || "${site_path:-site}" != "site" ]]; then
+    log "PACKAGE — ❌ require docs_dir: docs and site_dir: site; root/outside-output build paths are unsafe or invalid"
+    return 1
+  fi
+  local view="${DOCS_DIR}/docs" entry name
+  if [[ -L "$view" || ( -e "$view" && ! -d "$view" ) || -L "${DOCS_DIR}/site" ]]; then
+    log "PACKAGE — ❌ publishing directories must not redirect outside the docs output"
+    return 1
+  fi
+  local -a published=(L1 L2 L3 L4 diagrams assets index.md CHANGELOG.md REVIEW.md)
+  declare -A allowed=()
+  for name in "${published[@]}"; do allowed["$name"]=1; done
+  # Refuse conflicts before changing the view. Never overwrite user-owned files.
+  if [[ -d "$view" ]]; then
+    while IFS= read -r -d '' entry; do
+      name=${entry##*/}
+      if [[ -z "${allowed[$name]+x}" || ! -L "$entry" || "$(readlink "$entry")" != "../${name}" ]]; then
+        log "PACKAGE — ❌ conflicting user-owned publish-view entry: $entry"
+        return 1
+      fi
+    done < <(find "$view" -mindepth 1 -maxdepth 1 -print0)
+  fi
+  mkdir -p "$view" || return 1
+  for name in "${published[@]}"; do
+    if [[ -e "${DOCS_DIR}/${name}" ]]; then
+      [[ -L "${view}/${name}" ]] || ln -s "../${name}" "${view}/${name}" || return 1
+    elif [[ -L "${view}/${name}" ]]; then
+      rm "${view}/${name}" || return 1
+    fi
+  done
+}
+
+validate_site_build() {
+  prepare_mkdocs_source_view || return 1
+  if command -v mkdocs &>/dev/null; then
+    log "PACKAGE — building site..."
+    local build_output
+    rm -rf "${DOCS_DIR}/site"
+    if ! build_output=$(cd "${DOCS_DIR}" && mkdocs build --strict 2>&1); then
+      log "PACKAGE — ❌ mkdocs build failed. Output: ${build_output}"
+      return 1
+    fi
+    local page_count
+    page_count=$(find "${DOCS_DIR}/site" -name "*.html" | wc -l | xargs)
+    log "PACKAGE — site built (${page_count} pages in ${DOCS_DIR}/site/)"
+  else
+    log "PACKAGE — mkdocs not installed; navigation validated, site build NOT VERIFIED"
+  fi
+}
+
+validate_update_outputs() {
+  local slug classification tier
+  while IFS='|' read -r slug classification; do
+    case "$classification" in
+      NEW|MODIFIED|STRUCTURAL)
+        for tier in L2 L3 L4; do
+          if [[ ! -f "${DOCS_DIR}/${tier}/${slug}.md" ]]; then
+            echo "Affected component is missing ${tier} documentation: $slug" >&2
+            return 1
+          fi
+        done
+        ;;
+      REMOVED)
+        for tier in L2 L3 L4; do
+          if [[ -e "${DOCS_DIR}/${tier}/${slug}.md" ]]; then
+            echo "Removed component still has ${tier} documentation: $slug" >&2
+            return 1
+          fi
+        done
+        ;;
+    esac
+  done < <(parse_affected_components)
+  validate_inventory "$INVENTORY" && validate_component_groups
+}
+
+# Never label a default-config OpenClaw invocation as a requested model.
+# Hermes chat has documented --model support; no global agent config is changed.
+validate_agent_adapter() {
+  if [[ "$AGENT_ADAPTER" != "hermes" ]]; then
+    echo "AGENT — adapter '$AGENT_ADAPTER' cannot enforce requested per-call models. The legacy openclaw agent --local path is not model-routed here; explicitly select DEEP_DOCS_AGENT_ADAPTER=hermes (see references/legacy-safety-fixes.md)." >&2
+    return 78
+  fi
+  command -v python3 >/dev/null && command -v hermes >/dev/null || {
+    echo 'AGENT — python3 and hermes are required for the selected adapter' >&2
+    return 78
+  }
+  local help
+  help=$(hermes chat --help 2>&1) &&
+    [[ "$help" == *--model* && "$help" == *--query* && "$help" == *--quiet* ]] || {
+    echo 'AGENT — installed Hermes lacks the required chat --model/--query/--quiet interface' >&2
+    return 78
+  }
+}
+
+# One journal per docs output, across phases, source revisions and shell restarts.
+# Reserve before dispatch; abandoned reservations never become free retries.
 spawn_agent() {
-  local task="$1"
-  local label="$2"
-  local agent_timeout="${3:-$TIMEOUT}"
-  local agent_model="${4:-$QUALITY_MODEL}"  # logged but not yet actionable
+  local task="$1" label="$2" agent_timeout="${3:-$TIMEOUT}" agent_model="${4:-$QUALITY_MODEL}"
+  [[ "$AGENT_ADAPTER" == "hermes" ]] || { validate_agent_adapter; return 78; }
+  python3 - "$SCRATCH" "$label" "$agent_timeout" "$agent_model" "$task" <<'PY'
+import fcntl, json, math, os, pathlib, signal, subprocess, sys, tempfile, time
 
-  local session_id="dd-${label}-$(date +%s)"
+root, label, requested_timeout, model, task = sys.argv[1:]
+root = pathlib.Path(root)
+root.mkdir(parents=True, exist_ok=True)
+os.umask(0o077)
 
-  openclaw agent \
-    --local \
-    --session-id "$session_id" \
-    --message "$task" \
-    --timeout "$agent_timeout" \
-    < /dev/null > /dev/null 2>&1 || true
+def stop(message, code=75):
+    print('AGENT — ' + message, file=sys.stderr)
+    raise SystemExit(code)
+
+def positive(value):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError('expected a positive finite limit')
+    return number
+
+lock = (root / 'agent-budget.lock').open('a')
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    stop('another agent invocation owns this output budget')
+ledger = root / 'agent-budget.json'
+try:
+    state = json.loads(ledger.read_text()) if ledger.exists() else {
+        'version': 1, 'limits': {'max_invocations': 200, 'max_agent_seconds': 14400}, 'attempts': []}
+    if state['version'] != 1 or not isinstance(state['attempts'], list):
+        raise ValueError('invalid ledger schema')
+    if type(state['limits']['max_invocations']) is not int or state['limits']['max_invocations'] <= 0:
+        raise ValueError('invalid saved invocation limit')
+    positive(state['limits']['max_agent_seconds'])
+    for row in state['attempts']:
+        if row['status'] not in ('running', 'finished') or not math.isfinite(row['charged_seconds']) or row['charged_seconds'] < 0:
+            raise ValueError('invalid reservation')
+except (ValueError, KeyError, TypeError):
+    stop('invalid durable budget ledger; refusing to reset it')
+try:
+    calls_limit = int(os.environ.get('DEEP_DOCS_MAX_INVOCATIONS', state['limits']['max_invocations']))
+    seconds_limit = positive(os.environ.get('DEEP_DOCS_MAX_AGENT_SECONDS', state['limits']['max_agent_seconds']))
+    call_timeout = min(positive(requested_timeout), positive(os.environ.get('DEEP_DOCS_AGENT_TIMEOUT_SECONDS', requested_timeout)))
+    if calls_limit <= 0 or not model.strip():
+        raise ValueError('invalid call limit/model')
+except ValueError:
+    stop('invalid invocation/time budget or empty model', 78)
+
+def persist():
+    fd, tmp = tempfile.mkstemp(prefix='.agent-budget-', dir=root)
+    try:
+        with os.fdopen(fd, 'w') as out:
+            json.dump(state, out, indent=2, allow_nan=False)
+            out.write('\n')
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, ledger)
+        directory_fd = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+limits = dict(max_invocations=calls_limit, max_agent_seconds=seconds_limit)
+if limits != state['limits']:
+    state['limits'] = limits
+    persist()
+if any(row['status'] == 'running' for row in state['attempts']):
+    stop('unreconciled interrupted invocation; reservation retained, inspect agent-budget.json before retry')
+used_seconds = sum(row['charged_seconds'] for row in state['attempts'])
+if len(state['attempts']) >= calls_limit or used_seconds >= seconds_limit:
+    stop('durable invocation/time budget exhausted; limits may be raised explicitly, usage is not reset')
+allowance = min(call_timeout, seconds_limit - used_seconds)
+row = dict(label=label, requested_model=model, actual_model=None, adapter='hermes',
+           status='running', reserved_seconds=allowance, charged_seconds=allowance,
+           started_at=time.time(), elapsed_seconds=None, returncode=None)
+state['attempts'].append(row)
+persist()
+command = ['hermes', 'chat', '--model', model, '--query', task, '--quiet']
+if os.environ.get('DEEP_DOCS_HERMES_PROVIDER'):
+    command += ['--provider', os.environ['DEEP_DOCS_HERMES_PROVIDER']]
+child = None
+started = time.monotonic()
+code = 1
+cancelled = None
+
+def interrupted(signum, frame):
+    # Do not throw between OS process creation and binding its cleanup handle.
+    global cancelled
+    cancelled = signum
+
+signal.signal(signal.SIGTERM, interrupted)
+signal.signal(signal.SIGINT, interrupted)
+try:
+    # No shell, no approval bypass, and no in-memory buffering of agent output.
+    child = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True,
+                             env=dict(os.environ, DEEP_DOCS_AGENT_LABEL=label))
+    while True:
+        if cancelled is not None:
+            raise InterruptedError(cancelled)
+        remaining = allowance - (time.monotonic() - started)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, allowance)
+        try:
+            code = child.wait(timeout=min(0.1, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+except subprocess.TimeoutExpired:
+    code = 124
+    print('AGENT — hard invocation timeout: ' + label, file=sys.stderr)
+except InterruptedError as exc:
+    code = 128 + exc.args[0]
+except OSError as exc:
+    print('AGENT — adapter launch failed: ' + type(exc).__name__, file=sys.stderr)
+    code = 78
+finally:
+    if child is not None:
+        # Also terminate descendants left behind after the parent exits.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+    elapsed = time.monotonic() - started
+    row.update(status='finished', elapsed_seconds=elapsed, charged_seconds=elapsed,
+               returncode=code, finished_at=time.time())
+    persist()
+sys.exit(code if 0 <= code <= 255 else 1)
+PY
 }
 
 # ============================================================
@@ -409,34 +1187,57 @@ count_groups() {
   parse_groups | wc -l | xargs
 }
 
+remove_stale_group_docs() {
+  local groups_dir="${DOCS_DIR}/L2/groups"
+  [[ -d "$groups_dir" ]] || return 0
+  declare -A expected_groups=()
+  local slug name path_prefix components page page_slug
+  while IFS='|' read -r slug name path_prefix components; do expected_groups["$slug"]=1; done < <(parse_groups)
+  while IFS= read -r page; do
+    page_slug=${page##*/}; page_slug=${page_slug%.md}
+    if [[ -z "${expected_groups[$page_slug]+x}" ]]; then
+      rm -f "$page"
+      log "WRITE_GROUPS/${page_slug} — removed stale group page"
+    fi
+  done < <(find "$groups_dir" -maxdepth 1 -type f -name '*.md' 2>/dev/null)
+}
+
 phase_write_groups() {
   local groups_file="${DOCS_DIR}/builder/specs/component-groups.md"
   if [[ ! -f "$groups_file" ]]; then
+    remove_stale_group_docs
     log "WRITE_GROUPS — skipped (no component-groups.md)"
     return
   fi
 
   local total
   total=$(count_groups)
-  if (( total < 2 )); then
-    log "WRITE_GROUPS — skipped (fewer than 2 groups)"
-    return
+  validate_component_groups || return 1
+  if (( total == 0 )); then
+    remove_stale_group_docs
+    log "WRITE_GROUPS — skipped (all components are standalone)"
+    return 0
   fi
 
   mkdir -p "${DOCS_DIR}/L2/groups"
+  remove_stale_group_docs
   log "WRITE_GROUPS — started (${total} groups)"
 
   local i=0
+  local failures=0
   while IFS='|' read -r slug name path_prefix components; do
     i=$((i + 1))
 
-    # Resume support
-    if [[ -f "${DOCS_DIR}/L2/groups/${slug}.md" ]]; then
+    # Resume support. Update mode forces regeneration so membership changes are
+    # reflected even when a group page already exists from a prior run.
+    if [[ "${DEEP_DOCS_FORCE_GROUP_REFRESH:-0}" != "1" && -f "${DOCS_DIR}/L2/groups/${slug}.md" ]]; then
       log "WRITE_GROUPS/${slug} — skipped (exists, ${i}/${total})"
       continue
     fi
 
     log "WRITE_GROUPS/${slug} — started (${i}/${total})"
+    local group_marker="${SCRATCH}/write-group-${slug}-complete.md"
+    rm -f "$group_marker"
 
     # Build list of member L2/L3 files from the components field
     local member_l2_files=""
@@ -475,20 +1276,26 @@ Structure:
 Audience: architects, tech leads, BAs, new team members.
 Length: 3-6 pages. Use mermaid diagrams liberally.
 
+After the group page is complete, write ${group_marker} with the final non-empty line:
+GROUP_WRITE_COMPLETE
+
 ${HARD_RULES}"
 
-    spawn_agent "$task" "write-group-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
-
-    if [[ -f "${DOCS_DIR}/L2/groups/${slug}.md" ]]; then
+    if spawn_agent "$task" "write-group-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null &&
+       [[ -s "${DOCS_DIR}/L2/groups/${slug}.md" && -f "$group_marker" ]] &&
+       [[ "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$group_marker")" == "GROUP_WRITE_COMPLETE" ]]; then
       log "WRITE_GROUPS/${slug} — complete (${i}/${total})"
     else
       log "WRITE_GROUPS/${slug} — ❌ retrying (${i}/${total})"
-      spawn_agent "$task" "write-group-${slug}-retry" "$TIMEOUT" "$(model_for high)" > /dev/null
-      if [[ -f "${DOCS_DIR}/L2/groups/${slug}.md" ]]; then
+      rm -f "$group_marker"
+      if spawn_agent "$task" "write-group-${slug}-retry" "$TIMEOUT" "$(model_for high)" > /dev/null &&
+         [[ -s "${DOCS_DIR}/L2/groups/${slug}.md" && -f "$group_marker" ]] &&
+         [[ "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$group_marker")" == "GROUP_WRITE_COMPLETE" ]]; then
         log "WRITE_GROUPS/${slug} — complete on retry (${i}/${total})"
       else
         log "WRITE_GROUPS/${slug} — ❌ SKIPPED (${i}/${total})"
         echo "- Group: ${name} (${slug}): no group doc produced" >> "${DOCS_DIR}/builder/skipped-components.md"
+        failures=$((failures + 1))
       fi
     fi
   done < <(parse_groups)
@@ -496,6 +1303,7 @@ ${HARD_RULES}"
   local group_count
   group_count=$(find "${DOCS_DIR}/L2/groups" -name "*.md" 2>/dev/null | wc -l | xargs)
   log "WRITE_GROUPS — complete (${group_count}/${total} group docs)"
+  (( failures == 0 ))
 }
 
 # ============================================================
@@ -656,19 +1464,258 @@ ${HARD_RULES}"
 }
 
 # ============================================================
+# PHASE: update_inventory (update mode)
+# ============================================================
+phase_update_inventory() {
+  log "UPDATE_INVENTORY — started"
+  mkdir -p "$SCRATCH" "${DOCS_DIR}/builder/specs"
+
+  local old_inventory="${SCRATCH}/inventory-before-update.md"
+  local refresh_marker="${SCRATCH}/inventory-refresh-complete.md"
+  local groups_file="${DOCS_DIR}/builder/specs/component-groups.md"
+  local old_groups="${SCRATCH}/component-groups-before-update.md"
+
+  if [[ -f "$refresh_marker" && -f "$old_inventory" && -f "${SCRATCH}/inventory-delta.md" ]]; then
+    if validate_inventory "$INVENTORY" && validate_component_groups; then
+      log "UPDATE_INVENTORY — resumed (validated current inventory and groups)"
+      return 0
+    fi
+    log "UPDATE_INVENTORY — prior refresh invalid; regenerating"
+    rm -f "$refresh_marker" "${SCRATCH}/inventory-delta.md"
+  fi
+
+  [[ -f "$INVENTORY" ]] || {
+    log "UPDATE_INVENTORY — ❌ missing component inventory"
+    return 1
+  }
+  # Capture inventory and groups together once. Absence of old_groups means the
+  # successful baseline had no group file; never capture a partially refreshed one.
+  if [[ ! -f "$old_inventory" ]]; then
+    if [[ -f "$groups_file" ]]; then
+      cp "$groups_file" "$old_groups" || return 1
+    else
+      rm -f "$old_groups"
+    fi
+    cp "$INVENTORY" "$old_inventory" || return 1
+  fi
+
+  local task="Refresh the component inventory for an incremental documentation update.
+
+Read:
+- Existing inventory: ${old_inventory}
+- Existing groups: ${groups_file} (if present)
+- Discovery rules: ${SKILL_DIR}/references/discover.md
+- Source repository: ${REPO_PATH}
+
+Re-enumerate component boundaries exhaustively from the CURRENT source tree. Package-manager
+anchors and declared monorepo workspaces are mandatory components; do not sample. Update
+${INVENTORY} in place so it contains every current component and no removed component.
+
+Rules:
+- Preserve each surviving component's existing slug by matching its Path from the old inventory.
+- Derive a hyphenated deterministic slug only for genuinely new paths.
+- Keep the exact inventory table schema used by the existing file.
+- Recount source files and refresh names, languages, purpose, key files and dependencies.
+- If ${groups_file} exists, reconcile groups and standalone components; remove deleted slugs.
+  Preserve established group slugs. Every current slug must occur exactly once: either in a group
+  or in a '## Standalone Components' table with columns '| Component | Path | Reason |'.
+  Do NOT invent singleton groups. If no groups exist, use an empty group table and the note
+  'No component groups detected — all components are standalone.'
+- Do not modify any source file.
+
+After writing the inventory and groups, write ${refresh_marker} with the final non-empty line:
+INVENTORY_REFRESH_COMPLETE
+
+${HARD_RULES}"
+
+  local refresh_ok=false refresh_attempt
+  for refresh_attempt in 1 2; do
+    rm -f "$refresh_marker"
+    if spawn_agent "$task" "update-inventory-${refresh_attempt}" "$TIMEOUT" "$(model_for high)" > /dev/null &&
+       [[ -f "$refresh_marker" ]] &&
+       [[ "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$refresh_marker")" == "INVENTORY_REFRESH_COMPLETE" ]]; then
+      refresh_ok=true
+      break
+    fi
+    log "UPDATE_INVENTORY — refresh attempt ${refresh_attempt}/2 incomplete"
+  done
+
+  if [[ "$refresh_ok" != "true" ]]; then
+    cp "$old_inventory" "$INVENTORY"
+    if [[ -f "$old_groups" ]]; then
+      cp "$old_groups" "$groups_file"
+    else
+      rm -f "$groups_file"
+    fi
+    rm -f "$refresh_marker" "${SCRATCH}/inventory-delta.md"
+    log "UPDATE_INVENTORY — ❌ refresh agent did not produce a completion marker"
+    return 1
+  fi
+
+  if ! reconcile_inventory_slugs "$old_inventory" "$INVENTORY" || ! validate_inventory "$INVENTORY"; then
+    cp "$old_inventory" "$INVENTORY"
+    if [[ -f "$old_groups" ]]; then
+      cp "$old_groups" "$groups_file"
+    else
+      rm -f "$groups_file"
+    fi
+    rm -f "$refresh_marker" "${SCRATCH}/inventory-delta.md"
+    log "UPDATE_INVENTORY — ❌ refreshed inventory failed validation"
+    return 1
+  fi
+  write_inventory_delta "$old_inventory" "$INVENTORY" "${SCRATCH}/inventory-delta.md"
+  if ! validate_component_groups; then
+    cp "$old_inventory" "$INVENTORY"
+    if [[ -f "$old_groups" ]]; then
+      cp "$old_groups" "$groups_file"
+    else
+      rm -f "$groups_file"
+    fi
+    rm -f "$refresh_marker" "${SCRATCH}/inventory-delta.md"
+    log "UPDATE_INVENTORY — ❌ refreshed component groups failed validation"
+    return 1
+  fi
+
+  local new_count removed_count total
+  new_count=$(grep -c '| NEW |' "${SCRATCH}/inventory-delta.md" 2>/dev/null || true)
+  removed_count=$(grep -c '| REMOVED |' "${SCRATCH}/inventory-delta.md" 2>/dev/null || true)
+  total=$(count_components)
+  log "UPDATE_INVENTORY — complete (${total} current, ${new_count} new, ${removed_count} removed)"
+}
+
+# ============================================================
 # PHASE: review
 # ============================================================
+is_removal_only_update() {
+  [[ "$PHASE" == "update" ]] || return 1
+  validate_diff_inventory_delta || return 1
+  local slug classification count=0
+  while IFS='|' read -r slug classification; do
+    [[ "$classification" == "REMOVED" ]] || return 1
+    count=$((count + 1))
+  done < <(parse_affected_components)
+  (( count > 0 ))
+}
+
+system_review_is_clean() {
+  [[ -f "${SCRATCH}/review-system.md" ]] || return 1
+  /usr/bin/awk '
+    {
+      sub(/\r$/, "")
+      if ($0 == "SYSTEM_REVIEW_CLEAN" || $0 ~ /^SYSTEM_REVIEW_ISSUES: [0-9]+ unresolved$/) markers++
+      if (NF) last=$0
+    }
+    END { exit !(markers == 1 && last == "SYSTEM_REVIEW_CLEAN") }
+  ' "${SCRATCH}/review-system.md"
+}
+
+system_review_fingerprint() {
+  # Package owns index/nav, so these are checked by package validation, not this
+  # semantic review. Bind the review to the remaining documentation and delta.
+  {
+    printf 'range=%s\n' "$UPDATE_RUN_KEY"
+    /usr/bin/sha256sum "$INVENTORY" "${SCRATCH}/inventory-delta.md" "${SCRATCH}/update-diff.md"
+    [[ ! -f "${DOCS_DIR}/builder/specs/component-groups.md" ]] || /usr/bin/sha256sum "${DOCS_DIR}/builder/specs/component-groups.md"
+    find "${DOCS_DIR}/L1" "${DOCS_DIR}/L2" "${DOCS_DIR}/L3" "${DOCS_DIR}/L4" "${DOCS_DIR}/diagrams" -type f -print0 2>/dev/null |
+      sort -z | xargs -0 -r /usr/bin/sha256sum
+  } | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+}
+
+phase_review_removed_only() {
+  is_removal_only_update && validate_update_outputs && validate_current_docs || return 1
+  local review_file="${SCRATCH}/review-system.md"
+  rm -f "$review_file" "${SCRATCH}/review-system.fingerprint"
+  local task="Review this removal-only documentation update against pinned source ${HEAD_COMMIT}.
+Read ${SCRATCH}/update-diff.md, ${SCRATCH}/inventory-delta.md, ${INVENTORY}, and
+${DOCS_DIR}/builder/specs/component-groups.md if present. Verify the removed components are
+absent from source and current inventory/groups; their L2/L3/L4 pages must be absent.
+Review ${DOCS_DIR}/L1/, L2/, L3/, L4/, diagrams/ for stale references to removed components,
+incorrect counts, broken cross-references, and obsolete system descriptions. Check surviving
+components still have all three tiers. Fix documentation errors, never source; preserve HUMAN blocks.
+Index and MkDocs navigation will be regenerated and mechanically validated after this review.
+Write ${review_file} documenting the checks and unresolved issues. The final non-empty line must
+be exactly SYSTEM_REVIEW_CLEAN or SYSTEM_REVIEW_ISSUES: N unresolved. Emit exactly one outcome.
+Do not claim any removed component received a current-component review.
+${HARD_RULES}"
+  spawn_agent "$task" "review-system" "$TIMEOUT" "$(model_for high)" > /dev/null || return 1
+  system_review_is_clean && validate_update_outputs && validate_current_docs || return 1
+  system_review_fingerprint > "${SCRATCH}/review-system.fingerprint" || return 1
+  {
+    printf '# Removal-only Review\n\nCurrent affected component scope: 0. System-level removal review follows.\n\n'
+    cat "$review_file"
+  } > "${DOCS_DIR}/REVIEW.md"
+  verify_review_scope || return 1
+  log "REVIEW — removal-only system review complete (0 current affected components)"
+}
+
 phase_review() {
   log "REVIEW — started"
+  mkdir -p "$SCRATCH"
+  validate_reproducible_source || return 1
+  if [[ -z "$HEAD_COMMIT" ]]; then
+    HEAD_COMMIT=$(git -C "$REPO_PATH" rev-parse HEAD) || return 1
+  fi
+  assert_update_head_unchanged || return 1
+
+  if ! build_review_scope "$REVIEW_SCOPE_FILE"; then
+    log "REVIEW — ❌ could not build review scope"
+    return 1
+  fi
 
   local total
-  total=$(count_components)
+  total=$(wc -l < "$REVIEW_SCOPE_FILE" | xargs)
+  if (( total == 0 )); then
+    if is_removal_only_update; then
+      phase_review_removed_only
+      return $?
+    fi
+    log "REVIEW — ❌ empty review scope without validated removal-only changes"
+    return 1
+  fi
+
+  # A selection limits dispatch, NEVER the acceptance/coverage scope.
+  local selection="${DEEP_DOCS_REVIEW_SLUGS:-}" selected
+  if [[ -n "$selection" ]]; then
+    [[ "$selection" =~ ^[a-z0-9]+(-[a-z0-9]+)*(,[a-z0-9]+(-[a-z0-9]+)*)*$ ]] || {
+      log "REVIEW — ❌ DEEP_DOCS_REVIEW_SLUGS must be comma-separated exact slugs"
+      return 1
+    }
+    local -a selected_slugs
+    IFS=',' read -ra selected_slugs <<< "$selection"
+    for selected in "${selected_slugs[@]}"; do
+      /usr/bin/awk -F'|' -v wanted="$selected" '$1 == wanted {found=1} END {exit !found}' "$REVIEW_SCOPE_FILE" || {
+        log "REVIEW — ❌ selected slug not in required scope: $selected"
+        return 1
+      }
+    done
+  fi
+  local review_key existing_review_key=""
+  if [[ "$PHASE" == "update" ]]; then
+    if [[ -z "$UPDATE_RUN_KEY" && -f "$UPDATE_STATE_FILE" ]]; then
+      UPDATE_RUN_KEY=$(<"$UPDATE_STATE_FILE")
+    fi
+    review_key="v2:update:${UPDATE_RUN_KEY}:$(/usr/bin/sha256sum "$REVIEW_SCOPE_FILE" | /usr/bin/awk '{print $1}')"
+  else
+    review_key="v2:${PHASE}:${HEAD_COMMIT}:$(/usr/bin/sha256sum "$REVIEW_SCOPE_FILE" | /usr/bin/awk '{print $1}')"
+  fi
+  [[ -f "$REVIEW_STATE_FILE" ]] && existing_review_key=$(<"$REVIEW_STATE_FILE")
+  if [[ "$existing_review_key" != "$review_key" ]]; then
+    local reset_slug reset_name reset_path reset_files
+    while IFS='|' read -r reset_slug reset_name reset_path reset_files; do
+      rm -f "${SCRATCH}/review-${reset_slug}.md" "${SCRATCH}/review-${reset_slug}.fingerprint" "${SCRATCH}/review-${reset_slug}.previous.md"
+    done < "$REVIEW_SCOPE_FILE"
+    printf '%s\n' "$review_key" > "$REVIEW_STATE_FILE"
+    log "REVIEW — fresh scope (${total} components); stale scoped reviews invalidated"
+  else
+    log "REVIEW — resuming current scope (${total} components)"
+  fi
+
   local iteration=1
-  local max_iterations=3
+  local max_iterations="${DEEP_DOCS_REVIEW_MAX_ITERATIONS:-3}"
+  [[ "$max_iterations" =~ ^[1-3]$ ]] || { log "REVIEW — ❌ max iterations must be 1, 2 or 3"; return 1; }
+  local review_clean=false
 
   while (( iteration <= max_iterations )); do
-    # Pass 1: economy model (broad sweep across all components)
-    # Pass 2+: quality model (focused on known-issues components only — worth full accuracy)
     local review_model
     if (( iteration == 1 )); then
       review_model="$(model_for economy)"
@@ -678,84 +1725,184 @@ phase_review() {
     log "REVIEW — iteration ${iteration}/${max_iterations} (model: ${review_model})"
 
     local i=0
+    local slug name path files
     while IFS='|' read -r slug name path files; do
       i=$((i + 1))
-
-      # Skip if no docs exist
-      if [[ ! -f "${DOCS_DIR}/L2/${slug}.md" && ! -f "${DOCS_DIR}/L3/${slug}.md" && ! -f "${DOCS_DIR}/L4/${slug}.md" ]]; then
+      local review_file="${SCRATCH}/review-${slug}.md"
+      local status
+      status=$(review_status "$review_file" 2>/dev/null || true)
+      if [[ "$status" == "clean" ]] && review_fingerprint_matches "$slug"; then
+        log "REVIEW/${slug} — accepted current-run clean result (${i}/${total})"
         continue
       fi
+      if [[ -n "$selection" && ",${selection}," != *",${slug},"* ]]; then
+        log "REVIEW/${slug} — pending, outside retry selection (${i}/${total})"
+        continue
+      fi
+      local previous_review="${SCRATCH}/review-${slug}.previous.md" component_model="$review_model"
+      if [[ "$status" == "issues" ]]; then
+        cp "$review_file" "$previous_review" || return 1
+        component_model="$(model_for high)"
+      fi
+      rm -f "$review_file" "${SCRATCH}/review-${slug}.fingerprint"
 
-      # Resume support: skip if review already exists for this iteration
-      if [[ -f "${SCRATCH}/review-${slug}.md" ]]; then
-        log "REVIEW/${slug} — skipped (review exists, ${i}/${total})"
+      local missing_tiers=""
+      [[ -f "${DOCS_DIR}/L2/${slug}.md" ]] || missing_tiers="${missing_tiers} L2"
+      [[ -f "${DOCS_DIR}/L3/${slug}.md" ]] || missing_tiers="${missing_tiers} L3"
+      [[ -f "${DOCS_DIR}/L4/${slug}.md" ]] || missing_tiers="${missing_tiers} L4"
+      if [[ -n "$missing_tiers" ]]; then
+        cat > "$review_file" << EOF
+# Component Review: ${name}
+
+| File | Issue Found | Severity | Action Taken |
+|------|-------------|----------|--------------|
+| ${slug} | Missing required documentation tiers:${missing_tiers} | Error | Not reviewable |
+
+COMPONENT_ISSUES: 1 unresolved
+EOF
+        log "REVIEW/${slug} — COMPONENT_ISSUES missing${missing_tiers} (${i}/${total})"
         continue
       fi
 
       log "REVIEW/${slug} — started (${i}/${total})"
-
       local task="Review documentation for '${name}' against source code.
 
-Read ONLY:
+Read these component documents:
 - ${DOCS_DIR}/L2/${slug}.md
 - ${DOCS_DIR}/L3/${slug}.md
 - ${DOCS_DIR}/L4/${slug}.md
-- Source code at ${REPO_PATH}/${path}
+
+Source repository (absolute, read-only): ${REPO_PATH}
+Start with source at ${REPO_PATH}/${path}.
+Follow specific imports, referenced schemas, root configuration and relevant consumer/infrastructure wiring
+elsewhere inside this source repository when needed to verify a documented claim. Use targeted reads,
+not a whole-repository dump. Read-only Git inspection of this repository is allowed.
+Read permissions are repository-wide; documentation writes remain component-scoped.
+Modify only the three component documents above and the named review file below.
 
 Verify: file paths exist, function signatures match, env vars correct, described behaviour matches implementation, schemas match.
 
 For errors/warnings: FIX the documentation (not source code).
-For uncertainties: add <!-- UNVERIFIED -->.
+Resolve repository-answerable questions with the permitted targeted source reads.
+For generated claims that cannot be supported, remove the unsupported assertion or state precisely
+the source-confirmed behaviour and its evidence boundary. Keep genuinely unknown external context
+explicitly labelled <!-- UNVERIFIED --> and report it separately as an evidence limitation.
+Lack of runtime execution or an optional automated check is not itself a documentation error;
+do not imply those checks ran. Do not install dependencies, access live services or bypass command approvals.
+A marker alone never resolves an unsupported material claim.
+Preserve HUMAN blocks verbatim. Material unsupported HUMAN claims remain unresolved; do not edit or waive them.
+COMPONENT_ISSUES counts remaining factual errors, misleading/incomplete material claims and missing
+required verification of such claims, not merely accurately stated limits of this source-only review.
+Never obtain clean status by relabelling a remaining material issue as a limitation.
 
-Write ${SCRATCH}/review-${slug}.md with:
+Write ${review_file} with:
 | File | Issue Found | Severity | Action Taken |
 
-Output COMPONENT_CLEAN or COMPONENT_ISSUES: N unresolved
+The FINAL NON-EMPTY LINE of the review file and your response MUST be exactly one of:
+COMPONENT_CLEAN
+COMPONENT_ISSUES: N unresolved
+
+Never omit the marker. Never report clean while any issue remains.
 
 ${HARD_RULES}"
 
-      spawn_agent "$task" "review-${slug}" "$TIMEOUT" "$review_model" > /dev/null
-      if [[ -f "${SCRATCH}/review-${slug}.md" ]]; then
-        # Determine clean vs issues for progress log
-        if grep -q "COMPONENT_ISSUES" "${SCRATCH}/review-${slug}.md" 2>/dev/null; then
-          local n_issues
-          n_issues=$(grep -o "COMPONENT_ISSUES: [0-9]*" "${SCRATCH}/review-${slug}.md" | grep -o "[0-9]*$" || echo "?")
-          log "REVIEW/${slug} — complete: COMPONENT_ISSUES ${n_issues} unresolved (${i}/${total})"
-        else
-          log "REVIEW/${slug} — complete: COMPONENT_CLEAN (${i}/${total})"
-        fi
-      else
-        log "REVIEW/${slug} — ❌ no review file produced, retrying (${i}/${total})"
-        spawn_agent "$task" "review-${slug}-retry" "$TIMEOUT" "$review_model" > /dev/null
-        if [[ -f "${SCRATCH}/review-${slug}.md" ]]; then
-          log "REVIEW/${slug} — complete on retry (${i}/${total})"
-        else
-          log "REVIEW/${slug} — ❌ SKIPPED after retry (${i}/${total})"
-        fi
+      if [[ -s "$previous_review" ]]; then
+        component_model="$(model_for high)"
+        task+=$'\n'"Previous unresolved findings: ${previous_review}. Read these first, resolve or retain each material finding against source; do not repeat an unfocused full audit or erase findings by relabelling them."
       fi
-    done < <(parse_components)
+      local attempt=1
+      local agent_status
+      while (( attempt <= 2 )); do
+        status=""
+        spawn_agent "$task" "review-${slug}-attempt-${attempt}" "$TIMEOUT" "$component_model" > /dev/null
+        agent_status=$?
+        if (( agent_status == 0 )); then
+          assert_update_head_unchanged || { rm -f "$review_file"; return 1; }
+          status=$(review_status "$review_file" 2>/dev/null || true)
+        fi
+        [[ -n "$status" ]] && break
+        log "REVIEW/${slug} — failed process (${agent_status}) or malformed/missing result (${i}/${total})"
+        rm -f "$review_file" "${SCRATCH}/review-${slug}.fingerprint"
+        (( agent_status == 75 || agent_status == 78 || agent_status == 130 || agent_status == 143 )) && return "$agent_status"
+        attempt=$((attempt + 1))
+      done
 
-    # Aggregation
-    local issues
-    issues=$(grep -l "COMPONENT_ISSUES" "${SCRATCH}"/review-*.md 2>/dev/null | wc -l | xargs)
-    local clean
-    clean=$(grep -l "COMPONENT_CLEAN" "${SCRATCH}"/review-*.md 2>/dev/null | wc -l | xargs)
+      case "$status" in
+        clean)
+          if review_input_fingerprint "$slug" > "${SCRATCH}/review-${slug}.fingerprint"; then
+            log "REVIEW/${slug} — complete: COMPONENT_CLEAN (${i}/${total})"
+          else
+            rm -f "${SCRATCH}/review-${slug}.fingerprint"
+            status=""
+            log "REVIEW/${slug} — ❌ could not fingerprint reviewed inputs (${i}/${total})"
+          fi
+          ;;
+        issues)
+          rm -f "${SCRATCH}/review-${slug}.fingerprint"
+          local n_issues
+          n_issues=$(tail -1 "$review_file" | /usr/bin/grep -oE '[0-9]+' | tail -1 || echo "?")
+          log "REVIEW/${slug} — complete: COMPONENT_ISSUES ${n_issues} unresolved (${i}/${total})"
+          ;;
+        *)
+          log "REVIEW/${slug} — ❌ missing or malformed result after retry (${i}/${total})"
+          ;;
+      esac
+    done < "$REVIEW_SCOPE_FILE"
 
-    if (( issues == 0 )); then
-      log "REVIEW — iteration ${iteration}: REVIEW_CLEAN (${clean}/${total} components clean)"
+    local counts clean issues unknown counted_total
+    counts=$(review_scope_counts "$REVIEW_SCOPE_FILE")
+    IFS='|' read -r clean issues unknown counted_total <<< "$counts"
+
+    if (( clean == total && issues == 0 && unknown == 0 )); then
+      review_clean=true
+      log "REVIEW — iteration ${iteration}: REVIEW_CLEAN (${clean}/${total} required components clean)"
       break
-    else
-      log "REVIEW — iteration ${iteration}: ${issues} components with issues, ${clean} clean"
-      # Clear review files for components with issues so they get re-reviewed
-      grep -l "COMPONENT_ISSUES" "${SCRATCH}"/review-*.md 2>/dev/null | xargs rm -f
-      iteration=$((iteration + 1))
     fi
+
+    log "REVIEW — iteration ${iteration}: incomplete (${clean}/${total} clean, ${issues} issues, ${unknown} missing/malformed)"
+    iteration=$((iteration + 1))
   done
 
-  # Write REVIEW.md — quality model (aggregation requires cross-doc reasoning)
+  if [[ "$review_clean" != "true" ]]; then
+    printf '# Documentation Review\n\nIncomplete scoped result: `%s`\n' "$(review_scope_counts "$REVIEW_SCOPE_FILE")" > "${DOCS_DIR}/REVIEW.md"
+    log "REVIEW — ❌ incomplete; successful fingerprints retained, retry pending slugs with DEEP_DOCS_REVIEW_SLUGS"
+    return 1
+  fi
   log "REVIEW/aggregate — started"
-  spawn_agent "Aggregate all review files from ${SCRATCH}/review-*.md into ${DOCS_DIR}/REVIEW.md. Read only files with COMPONENT_ISSUES. Write summary table. ${HARD_RULES}" "review-aggregate" "$TIMEOUT" "$(model_for high)" > /dev/null
+  local aggregate_marker="${SCRATCH}/review-aggregate-complete.md"
+  local aggregate_fingerprint="${SCRATCH}/review-aggregate.fingerprint"
+  local aggregate_ok=false
+  if [[ -s "$aggregate_fingerprint" && -s "$aggregate_marker" &&
+        "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$aggregate_marker")" == "REVIEW_AGGREGATE_COMPLETE" &&
+        "$(<"$aggregate_fingerprint")" == "$(review_aggregate_fingerprint)" ]] &&
+     verify_review_scope && assert_update_head_unchanged; then
+    log "REVIEW — complete (unchanged aggregate and successful scoped results reused)"
+    return 0
+  fi
+  rm -f "$aggregate_fingerprint"
+  rm -f "$aggregate_marker"
+  if spawn_agent "Aggregate the component reviews listed in ${REVIEW_SCOPE_FILE} into ${DOCS_DIR}/REVIEW.md. Read exactly the corresponding ${SCRATCH}/review-<slug>.md files. Summarise clean, unresolved, missing and malformed results. Do not treat absent markers as clean. Then write ${aggregate_marker} with the final non-empty line REVIEW_AGGREGATE_COMPLETE. ${HARD_RULES}" "review-aggregate" "$TIMEOUT" "$(model_for high)" > /dev/null &&
+     [[ -f "${DOCS_DIR}/REVIEW.md" && -f "$aggregate_marker" ]] &&
+     [[ "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$aggregate_marker" 2>/dev/null)" == "REVIEW_AGGREGATE_COMPLETE" ]]; then
+    aggregate_ok=true
+  else
+    local final_counts
+    final_counts=$(review_scope_counts "$REVIEW_SCOPE_FILE")
+    printf '# Documentation Review\n\nAutomated scoped result: `%s`\n' "$final_counts" > "${DOCS_DIR}/REVIEW.md"
+    log "REVIEW/aggregate — ❌ aggregation failed or omitted its completion marker"
+  fi
   log "REVIEW/aggregate — complete"
+
+  if [[ "$review_clean" != "true" ]] || ! verify_review_scope "$REVIEW_SCOPE_FILE"; then
+    log "REVIEW — ❌ incomplete after ${max_iterations} iterations"
+    return 1
+  fi
+  if [[ "$aggregate_ok" != "true" ]]; then
+    return 1
+  fi
+
+  assert_update_head_unchanged || return 1
+  review_aggregate_fingerprint > "$aggregate_fingerprint" || return 1
   log "REVIEW — complete"
 }
 
@@ -765,58 +1912,49 @@ ${HARD_RULES}"
 phase_diff_discovery() {
   log "DIFF_DISCOVERY — started"
 
-  local last_run_date=""
-  local last_run_file="${DOCS_DIR}/builder/last-run.md"
-  if [[ -f "$last_run_file" ]]; then
-    last_run_date=$(grep '^date:' "$last_run_file" | sed 's/^date: *//' | xargs)
-    log "DIFF_DISCOVERY — last run: ${last_run_date}"
+  local last_run_date
+  last_run_date=$(read_last_run_field date)
+  if [[ -n "$BASE_COMMIT" ]]; then
+    log "DIFF_DISCOVERY — baseline commit: ${BASE_COMMIT} (last run: ${last_run_date:-unknown})"
   else
-    log "DIFF_DISCOVERY — no last-run.md found, comparing docs vs current source directly"
+    log "DIFF_DISCOVERY — no usable baseline commit; comparing current inventory and source directly"
   fi
 
-  # Pre-compute git diff to avoid agent needing to explore
+  # Pre-compute one immutable commit range for every later update phase.
   local git_diff_file="${SCRATCH}/git-diff-raw.md"
   mkdir -p "$SCRATCH"
-  if [[ -n "$last_run_date" ]]; then
-    local base_commit
-    base_commit=$(cd "$REPO_PATH" && git log --since="$last_run_date" --format=%H -- . | tail -1)
-    if [[ -n "$base_commit" ]]; then
-      {
-        echo "# Git Changes Since ${last_run_date}"
-        echo ""
-        echo "## Commits"
-        (cd "$REPO_PATH" && git log --oneline "${base_commit}..HEAD" -- .)
-        echo ""
-        echo "## Files Changed (name-status)"
-        (cd "$REPO_PATH" && git diff --name-status "${base_commit}..HEAD" -- .)
-        echo ""
-        echo "## Diffstat"
-        (cd "$REPO_PATH" && git diff --stat "${base_commit}..HEAD" -- .)
-      } > "$git_diff_file"
-    else
-      {
-        echo "# Git Changes (no commits found since ${last_run_date})"
-        echo ""
-        echo "## Recent Commits"
-        (cd "$REPO_PATH" && git log --oneline -20 -- .)
-        echo ""
-        echo "## Files Changed (last 20 commits)"
-        (cd "$REPO_PATH" && git diff --name-status HEAD~20..HEAD -- . 2>/dev/null || echo "Unable to diff")
-      } > "$git_diff_file"
-    fi
+  if [[ -n "$BASE_COMMIT" ]]; then
+    {
+      echo "# Git Changes: ${BASE_COMMIT}..${HEAD_COMMIT}"
+      echo
+      echo "## Commits"
+      git -C "$REPO_PATH" log --oneline "${BASE_COMMIT}..${HEAD_COMMIT}" -- .
+      echo
+      echo "## Files Changed (name-status)"
+      git -C "$REPO_PATH" diff --name-status "${BASE_COMMIT}..${HEAD_COMMIT}" -- .
+      echo
+      echo "## Diffstat"
+      git -C "$REPO_PATH" diff --stat "${BASE_COMMIT}..${HEAD_COMMIT}" -- .
+    } > "$git_diff_file"
     log "DIFF_DISCOVERY — git diff pre-computed to ${git_diff_file}"
   else
-    echo "# No last-run date — full comparison needed" > "$git_diff_file"
+    echo "# No usable Git baseline — full source/documentation comparison required" > "$git_diff_file"
   fi
 
   local task="You are running DIFF DISCOVERY for a documentation update.
+
+Source repository (absolute, read-only): ${REPO_PATH}
+Pinned source comparison: ${BASE_COMMIT}..${HEAD_COMMIT}
+Resolve changed source paths relative to that repository, not the documentation directory.
 
 Map git changes to documented components. Do NOT read L4 docs — use the
 component inventory to map file paths to component slugs.
 
 Read ONLY these files:
-- ${INVENTORY} (component list with paths — use this to map changed files to components)
-- ${last_run_file} (last run metadata)
+- ${INVENTORY} (current component list with paths — use this to map changed files to components)
+- ${SCRATCH}/inventory-before-update.md (inventory from the prior successful run)
+- ${SCRATCH}/inventory-delta.md (mechanically derived NEW, REMOVED and STRUCTURAL component paths)
+- ${LAST_RUN_FILE} (last run metadata)
 - ${git_diff_file} (pre-computed git diff — already generated, just read it)
 
 For MODIFIED components, you may read the specific changed source files listed in
@@ -827,6 +1965,15 @@ Mapping rules:
 - A changed file at path X belongs to the component whose Path column in the
   inventory is a prefix of X
 - If a changed file doesn't match any component path, note it as unmapped
+- Every NEW row in inventory-delta.md MUST appear in Affected Components as NEW.
+- Every REMOVED row in inventory-delta.md MUST appear in Affected Components as REMOVED.
+- Every STRUCTURAL row in inventory-delta.md MUST appear in Affected Components as STRUCTURAL.
+- Never classify a component still present in the current inventory as REMOVED.
+- Do not introduce NEW, REMOVED or STRUCTURAL rows absent from inventory-delta.md.
+- STRUCTURAL is reserved for component Path changes recorded in inventory-delta.md.
+- File moves between components whose Path values are unchanged are MODIFIED
+  for each affected existing component; describe the moved files in What Changed and Detail.
+  Internal file renames, extracted helpers and transferred exports do not make a component STRUCTURAL.
 
 Produce ${SCRATCH}/update-diff.md with this structure:
 
@@ -851,10 +1998,10 @@ For each MODIFIED component, describe specifically what changed:
 - Brief description of the nature of changes (read the actual changed files)
 
 Classifications:
-- NEW: component directories that exist in source but not in the inventory
+- NEW: component paths present in the current inventory but absent from inventory-before-update.md
 - MODIFIED: source files changed since last run within a documented component
-- REMOVED: documented components whose directories no longer exist
-- STRUCTURAL: renames, moves, reorganisation of component boundaries
+- REMOVED: component paths present in inventory-before-update.md but absent from the current inventory
+- STRUCTURAL: an existing component's Path changed, with an exact matching STRUCTURAL inventory-delta row
 - UNCHANGED: no git changes in the component's directory
 
 List affected components in dependency order.
@@ -863,31 +2010,141 @@ If NO changes detected: output NO_CHANGES_DETECTED as the final line.
 
 ${HARD_RULES}"
 
-  spawn_agent "$task" "diff-discovery" "$TIMEOUT" "$(model_for high)" > /dev/null
+  # A new invocation requires a fresh artifact AND a successful agent exit.
+  rm -f "${SCRATCH}/update-diff.md"
+  if ! spawn_agent "$task" "diff-discovery" "$TIMEOUT" "$(model_for high)" > /dev/null; then
+    rm -f "${SCRATCH}/update-diff.md"
+    log "DIFF_DISCOVERY — ❌ diff agent failed"
+    return 2  # 1 is reserved for validated no-change, never an agent failure.
+  fi
 
   if [[ -f "${SCRATCH}/update-diff.md" ]]; then
-    if grep -q "NO_CHANGES_DETECTED" "${SCRATCH}/update-diff.md" 2>/dev/null; then
+    if ! validate_diff_inventory_delta; then
+      log "DIFF_DISCOVERY — ❌ affected-component classifications do not match inventory delta"
+      return 2
+    fi
+    if diff_reports_no_changes; then
       log "DIFF_DISCOVERY — complete: NO_CHANGES_DETECTED"
       return 1  # Signal no changes
     fi
     local affected
-    affected=$(grep -cE '^\| .+ \| (NEW|MODIFIED|REMOVED|STRUCTURAL)' "${SCRATCH}/update-diff.md" 2>/dev/null || echo "0")
+    affected=$(grep -cE '^\| .+ \| (NEW|MODIFIED|REMOVED|STRUCTURAL)' "${SCRATCH}/update-diff.md" 2>/dev/null || true)
+    affected=${affected:-0}
     log "DIFF_DISCOVERY — complete (${affected} affected components)"
     return 0
   else
     log "DIFF_DISCOVERY — ❌ failed (no update-diff.md produced)"
-    exit 1
+    return 2
   fi
 }
 
-# Parse affected component slugs from update-diff.md
-# Returns pipe-delimited lines: slug|classification
+# Parse all rows from the affected-components section before validating classes.
+parse_all_affected_rows() {
+  [[ -f "${SCRATCH}/update-diff.md" ]] || return
+  /usr/bin/awk -F'|' '
+    /^## Affected Components[[:space:]]*$/ { in_affected=1; next }
+    in_affected && /^##[[:space:]]/ { exit }
+    in_affected && /^\|/ {
+      slug=$2; classification=$3
+      gsub(/`/, "", slug)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", slug)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", classification)
+      if (slug != "" && slug != "Slug" && slug !~ /^-+$/ &&
+          classification != "" && classification != "Classification" && classification !~ /^-+$/) {
+        print slug "|" classification
+      }
+    }
+  ' "${SCRATCH}/update-diff.md"
+}
+
+# Returns validated-class candidates as pipe-delimited lines: slug|classification
 parse_affected_components() {
-  /usr/bin/awk -F'|' '/^\| .+ \| (NEW|MODIFIED|REMOVED|STRUCTURAL)/ {
-    gsub(/`/, "", $2); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);  # slug (strip backticks)
-    gsub(/`/, "", $3); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);  # classification
-    if ($2 != "" && $2 != "Slug") print $2 "|" $3
-  }' "${SCRATCH}/update-diff.md"
+  parse_all_affected_rows | /usr/bin/awk -F'|' '$2 ~ /^(NEW|MODIFIED|REMOVED|STRUCTURAL)$/ { print $1 "|" $2 }'
+}
+
+diff_reports_no_changes() {
+  local diff_file="${SCRATCH}/update-diff.md"
+  [[ -f "$diff_file" ]] || return 1
+  [[ "$(/usr/bin/awk 'NF { last=$0 } END { print last }' "$diff_file")" == "NO_CHANGES_DETECTED" ]]
+}
+
+validate_diff_inventory_delta() {
+  local delta_file="${SCRATCH}/inventory-delta.md"
+  local old_inventory="${SCRATCH}/inventory-before-update.md"
+  [[ -f "$delta_file" && -f "$old_inventory" && -f "${SCRATCH}/update-diff.md" ]] || return 1
+
+  declare -A old_paths=() current_paths=() expected=() seen=()
+  local slug name path files classification expected_class affected_count=0 delta_count=0
+  while IFS='|' read -r slug name path files; do old_paths["$slug"]="$path"; done < <(parse_components_file "$old_inventory")
+  while IFS='|' read -r slug name path files; do current_paths["$slug"]="$path"; done < <(parse_components)
+  while IFS='|' read -r slug classification; do
+    [[ -z "$slug" ]] && continue
+    if [[ -n "${expected[$slug]+x}" ]]; then
+      echo "Duplicate inventory delta slug: $slug" >&2
+      return 1
+    fi
+    expected["$slug"]="$classification"
+    delta_count=$((delta_count + 1))
+  done < <(/usr/bin/awk -F'|' '/^\| `[^`]+` \| (NEW|REMOVED|STRUCTURAL) \|/ {
+    gsub(/`/, "", $2); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
+    print $2 "|" $3
+  }' "$delta_file")
+
+  while IFS='|' read -r slug classification; do
+    [[ -z "$slug" ]] && continue
+    affected_count=$((affected_count + 1))
+    if [[ -n "${seen[$slug]+x}" ]]; then
+      echo "Duplicate/conflicting affected component row: $slug" >&2
+      return 1
+    fi
+    seen["$slug"]="$classification"
+    expected_class=${expected[$slug]:-}
+    case "$classification" in
+      NEW)
+        [[ -n "${current_paths[$slug]+x}" && -z "${old_paths[$slug]+x}" && "$expected_class" == "NEW" ]] || {
+          echo "Impossible NEW classification for component: $slug" >&2; return 1;
+        }
+        ;;
+      REMOVED)
+        [[ -n "${old_paths[$slug]+x}" && -z "${current_paths[$slug]+x}" && "$expected_class" == "REMOVED" ]] || {
+          echo "Impossible REMOVED classification for component: $slug" >&2; return 1;
+        }
+        ;;
+      STRUCTURAL)
+        [[ -n "${old_paths[$slug]+x}" && -n "${current_paths[$slug]+x}" &&
+           "${old_paths[$slug]}" != "${current_paths[$slug]}" && "$expected_class" == "STRUCTURAL" ]] || {
+          echo "Impossible STRUCTURAL classification for component: $slug" >&2; return 1;
+        }
+        ;;
+      MODIFIED)
+        [[ -n "${old_paths[$slug]+x}" && -n "${current_paths[$slug]+x}" && -z "$expected_class" ]] || {
+          echo "Impossible MODIFIED classification for component: $slug" >&2; return 1;
+        }
+        ;;
+      *)
+        echo "Unknown affected classification for ${slug}: ${classification}" >&2
+        return 1
+        ;;
+    esac
+  done < <(parse_all_affected_rows)
+
+  for slug in "${!expected[@]}"; do
+    if [[ "${seen[$slug]:-}" != "${expected[$slug]}" ]]; then
+      echo "Inventory delta mismatch for ${slug}: expected ${expected[$slug]}, got ${seen[$slug]:-missing}" >&2
+      return 1
+    fi
+  done
+
+  if diff_reports_no_changes; then
+    (( affected_count == 0 && delta_count == 0 )) || {
+      echo "NO_CHANGES_DETECTED conflicts with affected or inventory-delta rows" >&2
+      return 1
+    }
+  elif (( affected_count == 0 )); then
+    echo "Diff report has neither affected components nor an exact terminal NO_CHANGES_DETECTED marker" >&2
+    return 1
+  fi
 }
 
 # Check if a slug is in the affected list
@@ -907,17 +2164,19 @@ get_classification() {
 # ============================================================
 phase_update_comprehend() {
   local affected_count
-  affected_count=$(parse_affected_components | grep -cE '\|(NEW|MODIFIED)$' || echo "0")
+  affected_count=$(parse_affected_components | grep -cE '\|(NEW|MODIFIED|STRUCTURAL)$' || true)
+  affected_count=${affected_count:-0}
   log "UPDATE_COMPREHEND — started (${affected_count} components to re-comprehend)"
 
   if (( affected_count == 0 )); then
-    log "UPDATE_COMPREHEND — skipped (no NEW or MODIFIED components)"
+    log "UPDATE_COMPREHEND — skipped (no NEW, MODIFIED or STRUCTURAL components)"
     return
   fi
 
   local total
   total=$(count_components)
   local i=0
+  local failures=0
 
   while IFS='|' read -r slug name path files; do
     i=$((i + 1))
@@ -925,8 +2184,8 @@ phase_update_comprehend() {
     local classification
     classification=$(get_classification "$slug")
 
-    # Only comprehend NEW and MODIFIED components
-    if [[ "$classification" != "NEW" && "$classification" != "MODIFIED" ]]; then
+    # Re-comprehend every current affected component.
+    if [[ "$classification" != "NEW" && "$classification" != "MODIFIED" && "$classification" != "STRUCTURAL" ]]; then
       continue
     fi
 
@@ -943,12 +2202,9 @@ phase_update_comprehend() {
     # Use git log directly to check what actually changed in this component.
     # Structural check — doesn't depend on how the diff agent worded things.
     local is_trivial=false
-    local last_run_date=""
-    last_run_date=$(/usr/bin/awk -F': ' '/^date:/{print $2}' "${DOCS_DIR}/builder/last-run.md" 2>/dev/null)
-
-    if [[ -n "$last_run_date" && -n "$path" ]]; then
+    if [[ -n "$BASE_COMMIT" && -n "$path" ]]; then
       local changed_files=""
-      changed_files=$(cd "$REPO_PATH" && git log --since="$last_run_date" --name-only --pretty=format: -- "$path" | /usr/bin/sort -u | /usr/bin/grep '[^[:space:]]')
+      changed_files=$(git -C "$REPO_PATH" diff --name-only "${BASE_COMMIT}..${HEAD_COMMIT}" -- "$path" | /usr/bin/sort -u | /usr/bin/grep '[^[:space:]]' || true)
       local changed_count=0
       changed_count=$(echo "$changed_files" | /usr/bin/grep -c '[^[:space:]]' || true)
       changed_count=${changed_count:-0}
@@ -968,7 +2224,7 @@ phase_update_comprehend() {
       # Also trivial if: ≤1 file changed AND ≤5 net lines
       if [[ "$changed_count" -le 1 ]] 2>/dev/null; then
         local net_lines=0
-        net_lines=$(cd "$REPO_PATH" && git log --since="$last_run_date" --numstat --pretty=format: -- "$path" | /usr/bin/awk '{a+=$1;d+=$2}END{print a+d+0}')
+        net_lines=$(git -C "$REPO_PATH" diff --numstat "${BASE_COMMIT}..${HEAD_COMMIT}" -- "$path" | /usr/bin/awk '{a+=$1;d+=$2}END{print a+d+0}')
         if [[ "$net_lines" -le 5 && "$net_lines" -gt 0 ]] 2>/dev/null; then
           is_trivial=true
         fi
@@ -1018,13 +2274,14 @@ Keep the summary under 50 lines.
 
 ${HARD_RULES}"
 
-      spawn_agent "$mini_task" "update-comprehend-${slug}" "$TIMEOUT" "$(model_for economy)" > /dev/null
-
-      if [[ -f "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
+      if spawn_agent "$mini_task" "update-comprehend-${slug}" "$TIMEOUT" "$(model_for economy)" > /dev/null &&
+         [[ -s "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
         log "UPDATE_COMPREHEND/${slug} — complete (minimal)"
       else
+        rm -f "${SCRATCH}/update-comprehend-${slug}-summary.md"
         log "UPDATE_COMPREHEND/${slug} — ❌ SKIPPED"
         echo "- ${name} (${slug}): update comprehend failed" >> "${DOCS_DIR}/builder/skipped-components.md"
+        failures=$((failures + 1))
       fi
       continue
     fi
@@ -1068,18 +2325,20 @@ Include a 'Changes Since Last Run' section at the top.
 ${HARD_RULES}"
 
     local result
-    result=$(spawn_agent "$task" "update-comprehend-${slug}" "$TIMEOUT" "$(model_for high)")
-
-    if [[ -f "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
+    if result=$(spawn_agent "$task" "update-comprehend-${slug}" "$TIMEOUT" "$(model_for high)") &&
+       [[ -s "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
       log "UPDATE_COMPREHEND/${slug} — complete"
     else
       log "UPDATE_COMPREHEND/${slug} — ❌ no summary produced, retrying"
-      result=$(spawn_agent "$task" "update-comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)")
-      if [[ -f "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
+      rm -f "${SCRATCH}/update-comprehend-${slug}-summary.md"
+      if result=$(spawn_agent "$task" "update-comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)") &&
+         [[ -s "${SCRATCH}/update-comprehend-${slug}-summary.md" ]]; then
         log "UPDATE_COMPREHEND/${slug} — complete on retry"
       else
+        rm -f "${SCRATCH}/update-comprehend-${slug}-summary.md"
         log "UPDATE_COMPREHEND/${slug} — ❌ SKIPPED after retry"
         echo "- ${name} (${slug}): update comprehend failed after 2 attempts" >> "${DOCS_DIR}/builder/skipped-components.md"
+        failures=$((failures + 1))
       fi
     fi
   done < <(parse_components)
@@ -1087,6 +2346,7 @@ ${HARD_RULES}"
   local summaries
   summaries=$(find "$SCRATCH" -name "update-comprehend-*-summary.md" 2>/dev/null | wc -l | xargs)
   log "UPDATE_COMPREHEND — complete (${summaries} summaries)"
+  (( failures == 0 ))
 }
 
 # ============================================================
@@ -1102,6 +2362,21 @@ phase_update_docs() {
   local i=0
   local updated=0
   local has_system_changes=false
+
+  # Removed components are absent from the refreshed inventory, so process them
+  # directly from the mechanically checked affected-component list.
+  local removed_slug removed_classification
+  while IFS='|' read -r removed_slug removed_classification; do
+    [[ "$removed_classification" == "REMOVED" ]] || continue
+    log "UPDATE_DOCS/${removed_slug} — removing docs (REMOVED)"
+    rm -f \
+      "${DOCS_DIR}/L2/${removed_slug}.md" \
+      "${DOCS_DIR}/L3/${removed_slug}.md" \
+      "${DOCS_DIR}/L4/${removed_slug}.md" \
+      "${SCRATCH}/review-${removed_slug}.md"
+    updated=$((updated + 1))
+    has_system_changes=true
+  done < <(parse_affected_components)
 
   while IFS='|' read -r slug name path files; do
     i=$((i + 1))
@@ -1157,7 +2432,10 @@ ${DOCS_DIR}/L4/${slug}.md
 
 ${HARD_RULES}"
 
-        spawn_agent "$task" "update-write-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
+        if ! spawn_agent "$task" "update-write-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null; then
+          log "UPDATE_DOCS/${slug} — ❌ documentation agent failed"
+          return 1
+        fi
 
         local written=0
         [[ -f "${DOCS_DIR}/L2/${slug}.md" ]] && written=$((written + 1))
@@ -1180,14 +2458,12 @@ ${HARD_RULES}"
         if grep -q "trivial/config-only" "$comprehend_file" 2>/dev/null; then
           skip_trivial=true
         else
-          local last_run_date=""
-          last_run_date=$(/usr/bin/awk -F': ' '/^date:/{print $2}' "${DOCS_DIR}/builder/last-run.md" 2>/dev/null)
-          if [[ -n "$last_run_date" && -n "$path" ]]; then
+          if [[ -n "$BASE_COMMIT" && -n "$path" ]]; then
             local changed_code=0
-            changed_code=$(cd "$REPO_PATH" && git log --since="$last_run_date" --name-only --pretty=format: -- "$path" | /usr/bin/sort -u | /usr/bin/grep '[^[:space:]]' | /usr/bin/grep -cvE '\.(json|yaml|yml|config|env|md)$|package-lock' || true)
+            changed_code=$(git -C "$REPO_PATH" diff --name-only "${BASE_COMMIT}..${HEAD_COMMIT}" -- "$path" | /usr/bin/sort -u | /usr/bin/grep '[^[:space:]]' | /usr/bin/grep -cvE '\.(json|yaml|yml|config|env|md)$|package-lock' || true)
             changed_code=${changed_code:-0}
             local changed_any=0
-            changed_any=$(cd "$REPO_PATH" && git log --since="$last_run_date" --name-only --pretty=format: -- "$path" | /usr/bin/sort -u | /usr/bin/grep -c '[^[:space:]]' || true)
+            changed_any=$(git -C "$REPO_PATH" diff --name-only "${BASE_COMMIT}..${HEAD_COMMIT}" -- "$path" | /usr/bin/sort -u | /usr/bin/grep -c '[^[:space:]]' || true)
             changed_any=${changed_any:-0}
             if [[ "$changed_any" -gt 0 && "$changed_code" -eq 0 ]] 2>/dev/null; then
               skip_trivial=true
@@ -1222,27 +2498,33 @@ IMPORTANT:
 
 ${HARD_RULES}"
 
-        spawn_agent "$task" "update-write-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
+        if ! spawn_agent "$task" "update-write-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null; then
+          log "UPDATE_DOCS/${slug} — ❌ documentation agent failed"
+          return 1
+        fi
         log "UPDATE_DOCS/${slug} — complete"
         ;;
     esac
     updated=$((updated + 1))
   done < <(parse_components)
 
-  # Regenerate group docs if groups exist and components changed
-  phase_write_groups
+  # Regenerate group docs from the refreshed membership on every update.
+  if ! DEEP_DOCS_FORCE_GROUP_REFRESH=1 phase_write_groups; then
+    log "UPDATE_DOCS/groups — ❌ one or more group pages failed to refresh"
+    return 1
+  fi
 
   # Regenerate overviews and L1 if there were system-level changes
   if [[ "$has_system_changes" == "true" ]] || (( updated > 0 )); then
     log "UPDATE_DOCS/overviews — regenerating"
 
-    spawn_agent "Update the system-level L2 overview. Read all L2 docs in ${DOCS_DIR}/L2/ and the change summary in ${SCRATCH}/update-diff.md. Update ${DOCS_DIR}/L2/overview.md to reflect current state. Preserve <!-- HUMAN --> blocks. ${HARD_RULES}" "update-l2-overview" "$TIMEOUT" "$(model_for high)" > /dev/null
+    spawn_agent "Update the system-level L2 overview. Read all L2 docs in ${DOCS_DIR}/L2/ and the change summary in ${SCRATCH}/update-diff.md. Update ${DOCS_DIR}/L2/overview.md to reflect current state. Preserve <!-- HUMAN --> blocks. ${HARD_RULES}" "update-l2-overview" "$TIMEOUT" "$(model_for high)" > /dev/null || return 1
     log "UPDATE_DOCS/L2/overview.md — updated"
 
-    spawn_agent "Update the L4 system overview. Read L4 files in ${DOCS_DIR}/L4/ plus ${DOCS_DIR}/diagrams/dependencies.mmd. Update ${DOCS_DIR}/L4/OVERVIEW.md. NO PROSE. ${HARD_RULES}" "update-l4-overview" "$TIMEOUT" "$(model_for high)" > /dev/null
+    spawn_agent "Update the L4 system overview. Read L4 files in ${DOCS_DIR}/L4/ plus ${DOCS_DIR}/diagrams/dependencies.mmd. Update ${DOCS_DIR}/L4/OVERVIEW.md. NO PROSE. ${HARD_RULES}" "update-l4-overview" "$TIMEOUT" "$(model_for high)" > /dev/null || return 1
     log "UPDATE_DOCS/L4/OVERVIEW.md — updated"
 
-    spawn_agent "Update the executive summary. Read L2 docs in ${DOCS_DIR}/L2/ and ${SCRATCH}/update-diff.md. Update ${DOCS_DIR}/L1/executive-summary.md. 1 page max, no code, no jargon. ${HARD_RULES}" "update-l1" "$TIMEOUT" "$(model_for high)" > /dev/null
+    spawn_agent "Update the executive summary. Read L2 docs in ${DOCS_DIR}/L2/ and ${SCRATCH}/update-diff.md. Update ${DOCS_DIR}/L1/executive-summary.md. 1 page max, no code, no jargon. ${HARD_RULES}" "update-l1" "$TIMEOUT" "$(model_for high)" > /dev/null || return 1
     log "UPDATE_DOCS/L1/executive-summary.md — updated"
   fi
 
@@ -1254,6 +2536,8 @@ ${HARD_RULES}"
 # ============================================================
 phase_changelog() {
   log "CHANGELOG — started"
+  local changelog_marker="${SCRATCH}/changelog-complete.md"
+  rm -f "$changelog_marker"
 
   local task="Generate a changelog entry for this documentation update.
 
@@ -1280,14 +2564,19 @@ Use this format:
 ### Impact Summary
 - 1-2 sentences: what this means for users of the codebase
 
+After the changelog is complete, write ${changelog_marker} with the final non-empty line:
+CHANGELOG_COMPLETE
+
 ${HARD_RULES}"
 
-  spawn_agent "$task" "changelog" "$TIMEOUT" "$(model_for high)" > /dev/null
+  spawn_agent "$task" "changelog" "$TIMEOUT" "$(model_for high)" > /dev/null || return 1
 
-  if [[ -f "${DOCS_DIR}/CHANGELOG.md" ]]; then
+  if [[ -f "${DOCS_DIR}/CHANGELOG.md" && -f "$changelog_marker" ]] &&
+     [[ "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$changelog_marker")" == "CHANGELOG_COMPLETE" ]]; then
     log "CHANGELOG — complete"
   else
-    log "CHANGELOG — ❌ no CHANGELOG.md produced"
+    log "CHANGELOG — ❌ output or completion marker missing"
+    return 1
   fi
 }
 
@@ -1299,15 +2588,23 @@ phase_record() {
   local components_list
 
   if [[ "$mode" == "update" ]]; then
-    components_list=$(parse_affected_components | cut -d'|' -f1 | paste -sd', ' -)
+    components_list=$(parse_affected_components | cut -d'|' -f1 | paste -sd, - | sed 's/,/, /g')
   else
-    components_list=$(parse_components | cut -d'|' -f1 | paste -sd', ' -)
+    components_list=$(parse_components | cut -d'|' -f1 | paste -sd, - | sed 's/,/, /g')
   fi
 
   local profile="large"  # Default; could be read from calibration.md if it existed
+  local source_commit
+  if [[ "$mode" == "update" ]]; then
+    assert_update_head_unchanged || return 1
+    source_commit="$HEAD_COMMIT"
+  else
+    source_commit=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+  fi
 
   cat > "${DOCS_DIR}/builder/last-run.md" << EOF
 date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+commit: ${source_commit}
 mode: ${mode}
 profile: ${profile}
 components: ${components_list}
@@ -1368,13 +2665,18 @@ Format:
 
 ${HARD_RULES}"
 
-  spawn_agent "$task" "history-harvest" 600 "$(model_for economy)" > /dev/null
+  rm -f "${SCRATCH}/history-harvest.md" || return 1
+  if ! spawn_agent "$task" "history-harvest" 600 "$(model_for economy)" > /dev/null ||
+     ! assert_update_head_unchanged; then
+    rm -f "${SCRATCH}/history-harvest.md"
+    return 1
+  fi
 
-  if [[ -f "${SCRATCH}/history-harvest.md" ]]; then
+  if [[ -s "${SCRATCH}/history-harvest.md" ]]; then
     log "HISTORY_HARVEST — complete"
   else
     log "HISTORY_HARVEST — ❌ failed"
-    exit 1
+    return 1
   fi
 }
 
@@ -1425,15 +2727,22 @@ Format:
 
 ${HARD_RULES}"
 
-  spawn_agent "$task" "history-epochs" "$TIMEOUT" "$(model_for high)" > /dev/null
+  rm -f "${SCRATCH}/history-epochs.md" || return 1
+  if ! spawn_agent "$task" "history-epochs" "$TIMEOUT" "$(model_for high)" > /dev/null ||
+     ! assert_update_head_unchanged; then
+    rm -f "${SCRATCH}/history-epochs.md"
+    return 1
+  fi
 
   if [[ -f "${SCRATCH}/history-epochs.md" ]]; then
     local epoch_count
-    epoch_count=$(grep -c '^## Epoch' "${SCRATCH}/history-epochs.md" 2>/dev/null || echo "0")
+    epoch_count=$(grep -c '^## Epoch' "${SCRATCH}/history-epochs.md" 2>/dev/null || true)
+    epoch_count=${epoch_count:-0}
+    (( epoch_count > 0 )) || { log "HISTORY_EPOCHS — ❌ no epochs produced"; return 1; }
     log "HISTORY_EPOCHS — complete (${epoch_count} epochs detected)"
   else
     log "HISTORY_EPOCHS — ❌ failed"
-    exit 1
+    return 1
   fi
 }
 
@@ -1445,18 +2754,17 @@ phase_history_comprehend() {
 
   # Extract epoch slugs from epochs file
   local epoch_count
-  epoch_count=$(grep -c '^## Epoch' "${SCRATCH}/history-epochs.md" 2>/dev/null || echo "0")
+  epoch_count=$(grep -c '^## Epoch' "${SCRATCH}/history-epochs.md" 2>/dev/null || true)
+  epoch_count=${epoch_count:-0}
+  (( epoch_count > 0 )) || return 1
 
   local i=0
   while (( i < epoch_count )); do
     i=$((i + 1))
     local slug="epoch-$(printf '%02d' "$i")"
 
-    # Resume support
-    if [[ -f "${SCRATCH}/history-${slug}.md" ]]; then
-      log "HISTORY_COMPREHEND/${slug} — skipped (exists)"
-      continue
-    fi
+    # History has no source-bound resume receipt; existence is not acceptance.
+    rm -f "${SCRATCH}/history-${slug}.md" || return 1
 
     log "HISTORY_COMPREHEND/${slug} — started (${i}/${epoch_count})"
 
@@ -1493,19 +2801,13 @@ Include a summary section at the end with the key narrative points for this epoc
 
 ${HARD_RULES}"
 
-    spawn_agent "$task" "history-comprehend-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null
-
-    if [[ -f "${SCRATCH}/history-${slug}.md" ]]; then
-      log "HISTORY_COMPREHEND/${slug} — complete (${i}/${epoch_count})"
-    else
-      log "HISTORY_COMPREHEND/${slug} — ❌ retrying (${i}/${epoch_count})"
-      spawn_agent "$task" "history-comprehend-${slug}-retry" "$TIMEOUT" "$(model_for high)" > /dev/null
-      if [[ -f "${SCRATCH}/history-${slug}.md" ]]; then
-        log "HISTORY_COMPREHEND/${slug} — complete on retry (${i}/${epoch_count})"
-      else
-        log "HISTORY_COMPREHEND/${slug} — ❌ SKIPPED (${i}/${epoch_count})"
-      fi
+    if ! spawn_agent "$task" "history-comprehend-${slug}" "$TIMEOUT" "$(model_for high)" > /dev/null ||
+       ! assert_update_head_unchanged || [[ ! -s "${SCRATCH}/history-${slug}.md" ]]; then
+      rm -f "${SCRATCH}/history-${slug}.md"
+      log "HISTORY_COMPREHEND/${slug} — ❌ failed (${i}/${epoch_count})"
+      return 1
     fi
+    log "HISTORY_COMPREHEND/${slug} — complete (${i}/${epoch_count})"
   done
 
   local completed
@@ -1518,6 +2820,8 @@ ${HARD_RULES}"
 # ============================================================
 phase_history_write() {
   log "HISTORY_WRITE — started"
+  local marker="${SCRATCH}/history-write-complete.md"
+  rm -f "$marker" || return 1
 
   local task="Synthesise all epoch notes into a narrative changelog.
 
@@ -1542,14 +2846,24 @@ Do NOT include:
 - Routine maintenance or dependency updates
 - Speculation about intent — only what the code shows
 
+After completing the changelog, write ${marker} with the final non-empty line:
+HISTORY_WRITE_COMPLETE
+
 ${HARD_RULES}"
 
-  spawn_agent "$task" "history-write" "$TIMEOUT" "$(model_for high)" > /dev/null
+  if ! spawn_agent "$task" "history-write" "$TIMEOUT" "$(model_for high)" > /dev/null ||
+     ! assert_update_head_unchanged; then
+    rm -f "$marker"
+    return 1
+  fi
 
-  if [[ -f "${DOCS_DIR}/CHANGELOG.md" ]]; then
+  if [[ -s "${DOCS_DIR}/CHANGELOG.md" && -f "$marker" ]] &&
+     [[ "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$marker")" == "HISTORY_WRITE_COMPLETE" ]]; then
     log "HISTORY_WRITE — complete"
   else
-    log "HISTORY_WRITE — ❌ no CHANGELOG.md produced"
+    log "HISTORY_WRITE — ❌ missing changelog or fresh completion marker"
+    rm -f "$marker"
+    return 1
   fi
 }
 
@@ -1586,29 +2900,36 @@ Fix any inaccuracies directly in ${DOCS_DIR}/CHANGELOG.md.
 Write ${SCRATCH}/history-review-${iteration}.md with:
 | Issue | Severity | Action Taken |
 
-Output on the final line: REVIEW_CLEAN or REVIEW_ISSUES: N unresolved
+Output exactly one outcome on the final non-empty line: REVIEW_CLEAN or REVIEW_ISSUES: N unresolved
 
 ${HARD_RULES}"
 
-    spawn_agent "$task" "history-review-${iteration}" "$TIMEOUT" "$(model_for high)" > /dev/null
-
-    if [[ -f "${SCRATCH}/history-review-${iteration}.md" ]]; then
-      if grep -q "REVIEW_CLEAN" "${SCRATCH}/history-review-${iteration}.md" 2>/dev/null; then
-        log "HISTORY_REVIEW — iteration ${iteration}: REVIEW_CLEAN"
-        break
-      else
-        local issues
-        issues=$(grep -o "REVIEW_ISSUES: [0-9]*" "${SCRATCH}/history-review-${iteration}.md" | grep -o "[0-9]*$" || echo "?")
-        log "HISTORY_REVIEW — iteration ${iteration}: ${issues} issues"
-        iteration=$((iteration + 1))
-      fi
-    else
-      log "HISTORY_REVIEW — iteration ${iteration}: ❌ no review file, retrying"
-      iteration=$((iteration + 1))
+    local review_file="${SCRATCH}/history-review-${iteration}.md"
+    rm -f "$review_file" || return 1
+    if ! spawn_agent "$task" "history-review-${iteration}" "$TIMEOUT" "$(model_for high)" > /dev/null ||
+       ! assert_update_head_unchanged; then
+      rm -f "$review_file"
+      log "HISTORY_REVIEW — ❌ reviewer failed or source changed"
+      return 1
     fi
+    if [[ -s "${DOCS_DIR}/CHANGELOG.md" && -f "$review_file" ]] && /usr/bin/awk '
+      {
+        sub(/\r$/, "")
+        if ($0 ~ /REVIEW_(CLEAN|ISSUES)/) markers++
+        if (NF) last=$0
+      }
+      END { exit !(markers == 1 && last == "REVIEW_CLEAN") }
+    ' "$review_file"; then
+      log "HISTORY_REVIEW — iteration ${iteration}: REVIEW_CLEAN"
+      log "HISTORY_REVIEW — complete"
+      return 0
+    fi
+    log "HISTORY_REVIEW — iteration ${iteration}: ❌ missing, malformed or unresolved outcome"
+    iteration=$((iteration + 1))
   done
 
-  log "HISTORY_REVIEW — complete"
+  log "HISTORY_REVIEW — ❌ incomplete after ${max_iterations} iterations"
+  return 1
 }
 
 # ============================================================
@@ -1616,6 +2937,8 @@ ${HARD_RULES}"
 # ============================================================
 phase_package() {
   log "PACKAGE — started"
+  local package_marker="${SCRATCH}/package-complete.md"
+  rm -f "$package_marker"
 
   # Build the project name from interview notes or fallback
   local project_name="Documentation"
@@ -1674,6 +2997,9 @@ Read:
 Generate TWO files:
 
 1. ${DOCS_DIR}/mkdocs.yml — Full MkDocs Material configuration with:
+   - REQUIRED layout: docs_dir: docs and site_dir: site. Never use docs_dir: . or an outside-output site_dir.
+     The orchestrator creates docs/ as a relative-symlink view of the authoritative root pages.
+     Do NOT move/copy root documents or create the docs/ view yourself.
    - Material theme with navigation.tabs, navigation.sections, search, dark mode toggle
    - Mermaid diagram support via pymdownx.superfences
    - Admonitions, tables, tabbed content, TOC with permalinks
@@ -1696,12 +3022,23 @@ Generate TWO files:
    - Module overview table (if groups exist) with links to group docs
    - Quick links to diagrams, changelog, review
 
-Use relative paths throughout. All files stay in their current locations —
-MkDocs serves directly from ${DOCS_DIR}/.
+After both files are complete, write ${package_marker} with the final non-empty line:
+PACKAGE_COMPLETE
+
+Use relative paths throughout. Authoritative documents stay in their current root locations.
+MkDocs serves the orchestrator-managed ${DOCS_DIR}/docs/ view and writes ${DOCS_DIR}/site/.
+A normal mkdocs build --strict must work; do not require stdin configuration or wrapper flags.
 
 ${HARD_RULES}"
 
-  spawn_agent "$task" "package" "$TIMEOUT" "$(model_for economy)" > /dev/null
+  if ! spawn_agent "$task" "package" "$TIMEOUT" "$(model_for economy)" > /dev/null; then
+    log "PACKAGE — ❌ package agent failed"
+    return 1
+  fi
+  if [[ ! -f "$package_marker" ]] || [[ "$(/usr/bin/awk 'NF{line=$0} END{print line}' "$package_marker")" != "PACKAGE_COMPLETE" ]]; then
+    log "PACKAGE — ❌ package agent did not produce a completion marker"
+    return 1
+  fi
 
   if [[ -f "${DOCS_DIR}/mkdocs.yml" ]]; then
     log "PACKAGE — mkdocs.yml generated"
@@ -1713,24 +3050,17 @@ ${HARD_RULES}"
   if [[ -f "${DOCS_DIR}/index.md" ]]; then
     log "PACKAGE — index.md generated"
   else
-    log "PACKAGE — ⚠️ index.md not generated (mkdocs.yml may still work)"
+    log "PACKAGE — ❌ index.md not generated"
+    return 1
   fi
 
-  # Try to build if mkdocs is available
-  if command -v mkdocs &>/dev/null; then
-    log "PACKAGE — building site..."
-    local build_output
-    build_output=$(cd "${DOCS_DIR}" && mkdocs build --strict 2>&1) || true
-    if [[ -d "${DOCS_DIR}/site" ]]; then
-      local page_count
-      page_count=$(find "${DOCS_DIR}/site" -name "*.html" | wc -l | xargs)
-      log "PACKAGE — site built (${page_count} pages in ${DOCS_DIR}/site/)"
-    else
-      log "PACKAGE — ⚠️ mkdocs build did not produce site/. Output: ${build_output}"
-    fi
-  else
-    log "PACKAGE — mkdocs not installed. To build: pip install mkdocs-material && cd ${DOCS_DIR} && mkdocs build"
+  if ! validate_site_navigation; then
+    log "PACKAGE — ❌ MkDocs navigation is incomplete or has missing targets"
+    return 1
   fi
+  log "PACKAGE — navigation validated against generated Markdown files"
+
+  validate_site_build || return 1
 
   log "PACKAGE — complete"
 }
@@ -1738,6 +3068,16 @@ ${HARD_RULES}"
 # ============================================================
 # Main
 # ============================================================
+if [[ "${DEEP_DOCS_TEST_MODE:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+# Serialize result invalidation as well as durable invocation reservations.
+mkdir -p "$SCRATCH" || exit 1
+exec 9>"${SCRATCH}/legacy-run.lock"
+flock -n 9 || { echo 'Another legacy run owns this docs output' >&2; exit 75; }
+validate_agent_adapter || exit $?
+
 case "$PHASE" in
   discover)
     phase_discover
@@ -1767,67 +3107,98 @@ case "$PHASE" in
     log "SYNTHESISE — complete"
 
     log "DIAGRAM — started"
-    spawn_agent "Read ${SKILL_DIR}/references/diagram.md. Read all synthesis notes from ${SCRATCH}/synthesise-*.md and ${DOCS_DIR}/builder/specs/component-inventory.md. Generate Mermaid diagrams to ${DOCS_DIR}/diagrams/. Write ${DOCS_DIR}/diagrams/INDEX.md. ${HARD_RULES}" "diagram" "$TIMEOUT" > /dev/null
+    spawn_agent "Read ${SKILL_DIR}/references/diagram.md. Read all synthesis notes from ${SCRATCH}/synthesise-*.md and ${DOCS_DIR}/builder/specs/component-inventory.md. Generate Mermaid diagrams to ${DOCS_DIR}/diagrams/. Write ${DOCS_DIR}/diagrams/INDEX.md. ${HARD_RULES}" "diagram" "$TIMEOUT" "$(model_for economy)" > /dev/null
     log "DIAGRAM — complete"
 
     phase_write
-    phase_review
+    phase_review || exit 1
+    phase_package || exit 1
     phase_record "init"
-    phase_package
 
     log "COMPLETE — deep-docs init finished"
     ;;
   update)
-    # Diff discovery — detect what changed
-    if ! phase_diff_discovery; then
-      log "COMPLETE — no changes detected, docs are up to date"
+    prepare_update_run_state || exit 1
+    phase_update_inventory || exit 1
+    assert_update_head_unchanged || exit 1
+
+    # Diff discovery — detect what changed and distinguish clean no-op from failure.
+    phase_diff_discovery
+    diff_status=$?
+    assert_update_head_unchanged || exit 1
+    if (( diff_status == 1 )); then
+      # Source classification does not prove the inherited documentation is complete.
+      validate_current_docs || exit 1
+      if ! validate_site_navigation; then
+        log "PACKAGE — missing/stale navigation despite unchanged source; regenerating"
+        phase_package || exit 1
+      else
+        validate_site_build || exit 1
+      fi
+      validate_current_docs && validate_site_navigation && assert_update_head_unchanged || exit 1
+      log "COMPLETE — no source changes; documentation outputs/navigation validated (no new semantic review)"
+      # No newly reviewed source baseline is claimed for a no-op.
       exit 0
+    elif (( diff_status != 0 )); then
+      log "COMPLETE — ❌ diff discovery failed validation"
+      exit "$diff_status"
     fi
 
     # Targeted comprehension for affected components
-    phase_update_comprehend
+    phase_update_comprehend || exit 1
+    assert_update_head_unchanged || exit 1
 
     # Re-synthesise if integration points changed
-    local needs_synthesis=false
-    if parse_affected_components | grep -qE '\|(NEW|REMOVED)$'; then
+    needs_synthesis=false
+    if parse_affected_components | grep -qE '\|(NEW|REMOVED|STRUCTURAL)$'; then
       needs_synthesis=true
     fi
     # Also re-synthesise if >3 components modified (likely cross-cutting change)
-    local modified_count
-    modified_count=$(parse_affected_components | grep -c '|MODIFIED$' || echo "0")
+    modified_count=$(parse_affected_components | grep -c '|MODIFIED$' || true)
+    modified_count=${modified_count:-0}
     if (( modified_count > 3 )); then
       needs_synthesis=true
     fi
 
     if [[ "$needs_synthesis" == "true" ]]; then
       log "SYNTHESISE — started (integration points changed)"
-      spawn_agent "Read ${SKILL_DIR}/references/synthesise.md. Read all summary scratchpads from ${SCRATCH}/update-comprehend-*-summary.md and ${SCRATCH}/comprehend-*-summary.md. Read ${INVENTORY}. Write synthesis files to ${SCRATCH}/synthesise-01-integration.md, synthesise-02-flows.md, synthesise-03-architecture.md. Focus on what CHANGED. ${HARD_RULES}" "update-synthesise" "$TIMEOUT" "$(model_for high)" > /dev/null
+      spawn_agent "Read ${SKILL_DIR}/references/synthesise.md. Read all summary scratchpads from ${SCRATCH}/update-comprehend-*-summary.md and ${SCRATCH}/comprehend-*-summary.md. Read ${INVENTORY}. Write synthesis files to ${SCRATCH}/synthesise-01-integration.md, synthesise-02-flows.md, synthesise-03-architecture.md. Focus on what CHANGED. ${HARD_RULES}" "update-synthesise" "$TIMEOUT" "$(model_for high)" > /dev/null || exit 1
       log "SYNTHESISE — complete"
 
       log "DIAGRAM — started (updating)"
-      spawn_agent "Read ${SKILL_DIR}/references/diagram.md. Read synthesis notes from ${SCRATCH}/synthesise-*.md and ${INVENTORY}. Update Mermaid diagrams in ${DOCS_DIR}/diagrams/. Update ${DOCS_DIR}/diagrams/INDEX.md. ${HARD_RULES}" "update-diagram" "$TIMEOUT" "$(model_for economy)" > /dev/null
+      spawn_agent "Read ${SKILL_DIR}/references/diagram.md. Read synthesis notes from ${SCRATCH}/synthesise-*.md and ${INVENTORY}. Update Mermaid diagrams in ${DOCS_DIR}/diagrams/. Update ${DOCS_DIR}/diagrams/INDEX.md. ${HARD_RULES}" "update-diagram" "$TIMEOUT" "$(model_for economy)" > /dev/null || exit 1
       log "DIAGRAM — complete"
+      assert_update_head_unchanged || exit 1
     fi
 
-    # Surgical doc updates
-    phase_update_docs
+    # Surgical doc updates and hard output postconditions.
+    phase_update_docs || exit 1
+    assert_update_head_unchanged || exit 1
+    validate_update_outputs || {
+      log "UPDATE_DOCS — ❌ generated output validation failed"
+      exit 1
+    }
 
-    # Changelog
-    phase_changelog
+    phase_changelog || exit 1
+    assert_update_head_unchanged || exit 1
+    phase_review || exit 1
+    assert_update_head_unchanged || exit 1
 
-    # Review (same as init — verifies all updated docs)
-    phase_review
+    # Rebuild navigation/index after added or removed pages, then validate again.
+    phase_package || exit 1
+    assert_update_head_unchanged || exit 1
+    validate_update_outputs && verify_review_scope || exit 1
 
-    # Record last run
-    phase_record "update"
+    # Advance the baseline only after docs, review, navigation and build validation.
+    phase_record "update" || exit 1
 
     log "COMPLETE — deep-docs update finished"
     ;;
   history)
     # Parse history-specific options from remaining args (after $4/model)
-    local history_since=""
-    local history_last=""
-    local history_granularity="major"
+    history_since=""
+    history_last=""
+    history_granularity="major"
 
     shift 4 2>/dev/null || shift $# 2>/dev/null  # skip phase, repo, docs, model
     while [[ $# -gt 0 ]]; do
@@ -1841,13 +3212,19 @@ case "$PHASE" in
 
     log "HISTORY — started (since: ${history_since:-all}, last: ${history_last:-all}, granularity: ${history_granularity})"
 
-    mkdir -p "$SCRATCH"
+    mkdir -p "$SCRATCH" || exit 1
+    rm -f "${SCRATCH}/history-harvest.md" "${SCRATCH}/history-epochs.md" \
+      "${SCRATCH}"/history-epoch-*.md "${SCRATCH}"/history-review-*.md \
+      "${SCRATCH}/history-write-complete.md" || exit 1
+    validate_reproducible_source || exit 1
+    HEAD_COMMIT=$(git -C "$REPO_PATH" rev-parse HEAD) || exit 1
 
-    phase_history_harvest "$history_since" "$history_last" "$history_granularity"
-    phase_history_epochs "$history_granularity"
-    phase_history_comprehend
-    phase_history_write
-    phase_history_review
+    phase_history_harvest "$history_since" "$history_last" "$history_granularity" || exit 1
+    phase_history_epochs "$history_granularity" || exit 1
+    phase_history_comprehend || exit 1
+    phase_history_write || exit 1
+    phase_history_review || exit 1
+    assert_update_head_unchanged || exit 1
 
     # Note: history mode does NOT update last-run.md (read-only analysis)
     log "COMPLETE — deep-docs history finished"

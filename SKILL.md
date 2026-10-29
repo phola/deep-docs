@@ -1,20 +1,27 @@
 ---
 name: deep-docs
 description: >
-  Generate deep, multi-audience documentation for any code repository using bottom-up
-  comprehension loops and tiered output (L1 executive → L4 model context). Use when:
-  (1) documenting an undocumented or poorly-documented codebase from scratch,
-  (2) updating existing docs after code changes,
-  (3) generating retrospective changelogs from git history,
-  (4) onboarding new team members or AI agents to a codebase.
-  Modes: init (full run), update (incremental), history (retrospective changelog).
-  Never modifies source code — documentation only.
+  Use when investigating a repository or maintaining source-grounded documentation.
+  Default to bounded questions, exact-commit evidence, a small maintained handbook
+  and mechanical reference. Retain the legacy tiered engine only for explicitly
+  requested full runs or compatible existing outputs. Never modify source code.
 ---
 
 # deep-docs
 
-Generate thorough, multi-audience documentation for any repository through iterative
-comprehension loops. Documents the **as-is state** — never suggests fixes or improvements.
+Use the [source-grounded workflow](references/grounded-workflow.md) by default:
+
+1. Pin a clean Git checkout and initialise a separate output directory with `scripts/grounded.py`.
+2. Investigate a bounded useful question through an existing authorised agent and source tools.
+3. Retain supported claims with exact source spans, explicit gaps and agent/model metadata.
+4. Verify artifact/citation integrity; separately assess semantic support. Neither is a full repository audit.
+5. Build the small static reference/answer site, and flag affected or unknown-impact evidence on later source changes.
+
+Preserve existing docs and HUMAN blocks without importing their unsupported claims as facts. Keep code-derived behaviour, human intent and live operational evidence distinct. Do not start the exhaustive pipeline unless explicitly requested. Do not add a hosted service, code upload, deployment or watcher by implication.
+
+## Legacy tiered workflow
+
+The remainder describes the optional tiered engine. Read [legacy safety fixes](references/legacy-safety-fixes.md) before running it: adapter selection, durable budgets, focused review and same-source resume supersede older examples where they differ. Documents describe the **as-is state**, not proposed source improvements.
 
 ## Modes
 
@@ -26,9 +33,9 @@ comprehension loops. Documents the **as-is state** — never suggests fixes or i
 
 ## Quick Start
 
-1. Determine mode from user request (default: `init`)
-2. Read the relevant phase guide from `references/`
-3. Execute phases in order, spawning sub-agents as described
+1. Confirm that a legacy tiered run was explicitly requested; otherwise use the source-grounded workflow above.
+2. Determine legacy mode from that request and read its phase guide plus the legacy safety/adapter guide.
+3. Execute only the authorised scope within persisted budgets; preserve failures and incompleteness rather than returning false success.
 
 ## Model Routing
 
@@ -38,6 +45,8 @@ The orchestrator uses two model tiers to balance quality and cost:
 |------|--------|---------|
 | **Quality** | comprehend, synthesise, write, review pass 2+ | `MODEL` arg (default: claude-opus-4-6) |
 | **Economy** | discover, review pass 1, diagram | `DEEP_DOCS_ECONOMY_MODEL` env var (default: claude-sonnet-4-6) |
+
+Before any legacy example below, explicitly select `DEEP_DOCS_AGENT_ADAPTER=hermes` and models supported by your configured provider; see the [adapter contract](references/legacy-safety-fixes.md#explicit-model-adapter). The historical default OpenClaw launcher now refuses dispatch rather than silently ignoring the requested model.
 
 Override examples:
 ```bash
@@ -166,8 +175,8 @@ Examples:
 [07:20] COMPREHEND/auth — loop 1/7 complete (inventory: 34 files catalogued)
 [07:21] COMPREHEND/auth — loop 2/7 complete (data: 6 schemas found)
 ...
-[07:45] COMPREHEND — all 12 components complete (2 skipped: see skipped-components.md)
-[07:46] SYNTHESISE — started (batched, 3 groups)
+[07:45] COMPREHEND — incomplete (10/12 components completed; 2 failed)
+[07:46] RESUME — only after investigating failures; no success baseline advanced
 [07:48] SYNTHESISE — group 1/3 complete
 ...
 [08:10] REVIEW — iteration 1: 4 errors, 7 warnings fixed
@@ -202,19 +211,9 @@ See [calibrate.md](references/calibrate.md). Auto-selected based on repo size.
 
 ## Error Handling
 
-When a sub-agent fails (timeout, error, partial output):
+When a sub-agent fails (timeout, error, partial output), preserve evidence and return a non-successful phase result if mandatory work remains incomplete. A partial artifact or clean-looking marker cannot override a failed invocation. Do not advance the successful baseline or describe skipped components as reviewed.
 
-1. **Comprehend/Write sub-agent fails:** Retry once. If it fails again, skip the component
-   and note it in `{{DOCS_DIR}}/builder/skipped-components.md`. Continue with remaining
-   components — don't abort the whole run.
-2. **Synthesise/Diagram sub-agent fails:** Retry once. If it fails again, proceed to write
-   phase without synthesis/diagrams — the comprehension scratchpads are sufficient for
-   basic docs. Note the gap in REVIEW.md.
-3. **Review sub-agent fails:** Retry once. If it fails again, present whatever partial
-   review exists to the user.
-4. **Discover/Calibrate fails:** Cannot continue — inform the user and stop.
-
-For parallel sub-agents (large profile), allow individual failures without aborting siblings.
+Resume only against matching source/scope/artifact identity. Retry pending or changed components within the durable budget; successful fingerprints remain reusable. A focused dispatch selector never narrows the final acceptance scope. The new grounded workflow is separate and does not require completing a paused exhaustive legacy audit.
 
 ## Orchestration
 
@@ -235,10 +234,10 @@ scripts/orchestrate.sh review {{REPO_PATH}} {{DOCS_DIR}}
 
 The script:
 - Parses component-inventory.md and loops through every row
-- Spawns one `openclaw agent` per component
-- Verifies output files exist before moving on
-- Retries once on failure, then logs to skipped-components.md
-- Supports resume (skips components with existing outputs)
+- Dispatches through the explicitly selected supported adapter with the requested model.
+- Checks mandatory artifacts and failure status; mere file existence is not certification.
+- Enforces cumulative invocation/time limits across restarts.
+- Reuses review results only with matching source/scope/document fingerprints.
 - Appends to progress.md at every step
 
 Interview is still interactive (the primary agent handles it). The script takes over
